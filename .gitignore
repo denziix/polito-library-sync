@@ -218,3 +218,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# polito-library-sync runtime data (login token, state, logs)
+data/
