@@ -1,4 +1,6 @@
 requests>=2.31
+sv-ttk>=2.6
+Pillow>=10
 # optional, for Windows toast notifications:
 # winotify
 # optional, for "Summarize with Claude" in the Upcoming tab (also needs ANTHROPIC_API_KEY in .env):
