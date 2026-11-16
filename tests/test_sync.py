@@ -116,5 +116,77 @@ class SyncTests(unittest.TestCase):
         self.assertEqual(ps.norm("Propulsion Systems & their..."), "propulsionsystemstheir")
 
 
+class NoticeApi(FakeApi):
+    def __init__(self, notices):
+        super().__init__(TREE)
+        self.by_course = notices
+
+    def notices(self, course_id):
+        return self.by_course.get(course_id, [])
+
+
+def notice(nid, text, published="2026-11-10T09:00:00Z", course="Fisica 1", cid=7):
+    return {"id": nid, "course": course, "courseId": cid, "publishedAt": published, "text": text}
+
+
+class NoticeTests(unittest.TestCase):
+    def test_html_to_text_and_links(self):
+        text, links = ps.html_to_text('<p>Hello&nbsp;<b>all</b></p><ul><li>one</li><li>two</li></ul>'
+                                      '<p>See <a href="https://polito.it/x">here</a></p>')
+        self.assertEqual(text, "Hello all\n\n• one\n\n• two\n\nSee here")
+        self.assertEqual(links, ["https://polito.it/x"])
+
+    def test_fetch_notices_marks_new_after_first_fetch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_cfg(tmp)
+            raw = {7: [{"id": 1, "publishedAt": "2026-11-01T10:00:00Z", "expiresAt": None, "content": "<p>A</p>"}],
+                   9: [{"id": 2, "publishedAt": "2026-11-03T10:00:00Z", "expiresAt": None, "content": "<p>B</p>"}],
+                   8: [{"id": 3, "publishedAt": "2026-11-04T10:00:00Z", "expiresAt": None, "content": "x"}]}
+            api = NoticeApi(raw)
+            first = ps.fetch_notices(api, cfg)
+            self.assertEqual([n["id"] for n in first], [2, 1])  # newest first; course 8 not in study plan
+            self.assertFalse(any(n["new"] for n in first))       # first fetch is a baseline
+            raw[7].append({"id": 5, "publishedAt": "2026-11-05T10:00:00Z", "expiresAt": None, "content": "C"})
+            second = ps.fetch_notices(api, cfg)
+            self.assertEqual({n["id"]: n["new"] for n in second}, {5: True, 2: False, 1: False})
+            cached, at = ps.load_cached_notices(cfg)
+            self.assertEqual(len(cached), 3)
+            self.assertIsNotNone(at)
+
+    def test_find_dates_formats(self):
+        ref = ps.date(2026, 11, 10)
+        d = lambda s: [x[0] for x in ps.find_dates(s, ref)]  # noqa: E731
+        self.assertEqual(d("on 18/11 at 14:30"), [ps.date(2026, 11, 18)])
+        self.assertEqual(d("il 3.12.2026 ore 10"), [ps.date(2026, 12, 3)])
+        self.assertEqual(d("2026-12-01"), [ps.date(2026, 12, 1)])
+        self.assertEqual(d("Thursday, November 20th"), [ps.date(2026, 11, 20)])
+        self.assertEqual(d("giovedì 15 gennaio"), [ps.date(2027, 1, 15)])  # rolls into next year
+        self.assertEqual(d("the 2nd of Dec 2026"), [ps.date(2026, 12, 2)])
+        self.assertEqual(d("version 14.30 and score 7/30"), [])  # no fake dates
+        self.assertEqual(ps.find_time("from 2 pm"), "14:00")
+        self.assertEqual(ps.find_time("ore 9.15"), "09:15")
+
+    def test_extract_events_and_heads_up(self):
+        today = ps.date(2026, 11, 16)
+        notices = [
+            notice(1, "Dear students,\nOn 20 November at 15:00 there will be a seminar by a guest speaker "
+                      "from ESA in room 1P.\nRegards"),
+            notice(2, "The lecture of 18/11 is cancelled.", course="Chimica", cid=9),
+            notice(3, "The midterm exam was on 3 November.", published="2026-10-20T09:00:00Z"),
+            notice(4, "The deadline for the lab report has been extended, see the portal.",
+                   published="2026-11-14T09:00:00Z"),
+            notice(5, "New slides uploaded.", published="2026-11-15T09:00:00Z"),
+        ]
+        events, heads = ps.extract_events(notices, today)
+        self.assertEqual([(e["notice_id"], e["date"], e["kind"]) for e in events],
+                         [(2, ps.date(2026, 11, 18), "Class change"),
+                          (1, ps.date(2026, 11, 20), "Seminar / talk")])
+        self.assertEqual(events[1]["time"], "15:00")
+        self.assertIn("ESA", events[1]["snippet"])
+        self.assertEqual([(h["notice_id"], h["kind"]) for h in heads], [(4, "Deadline")])
+        groups = ps.group_events(events, today)
+        self.assertEqual([g[0] for g in groups], ["Next 7 days"])
+
+
 if __name__ == "__main__":
     unittest.main()

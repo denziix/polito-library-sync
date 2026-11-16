@@ -1,3 +1,5 @@
 requests>=2.31
 # optional, for Windows toast notifications:
 # winotify
+# optional, for "Summarize with Claude" in the Upcoming tab (also needs ANTHROPIC_API_KEY in .env):
+# anthropic

@@ -22,6 +22,17 @@ the user's own course folders. Shared with friends via GitHub (they use Download
 - `GET /courses/{id}/files` -> tree of `{type: directory|file}`; files have `id`, `name`, `mimeType`,
   `sizeInKiloBytes`, `createdAt`, `checksum`.
 - `GET /courses/{id}/files/{fileId}` -> 302 redirect to the file (token only sent to the API host).
+- `GET /courses/{id}/notices` -> `data[]` of `{id, publishedAt, expiresAt|null, content (HTML)}`. No title field.
+  (Note: the spec lives on the `master` branch of polito/api-spec, not `main`.)
+
+## Notices + Upcoming tabs
+- `fetch_notices()` reads all study-plan courses' notices, converts HTML to text, caches them in
+  `data/notices.json` (with a `seen` list: notices not seen before get `new: True`; the first fetch is a baseline).
+- `extract_events()` is the offline "assistant": finds dates (EN/IT, numeric and month names, no-year
+  dates roll forward), times and a kind (Seminar / talk, Exam, Deadline, Class change, Lab) per sentence;
+  undated important notices from the last 14 days become "heads-up". Works with no API key.
+- `ai_summary()` is optional: Claude (`claude-opus-5-5`) writes a digest if `anthropic` is installed and
+  `ANTHROPIC_API_KEY` is in `.env` (Settings has the field). Not a required dependency.
 
 ## Sync rules (keep these; the user relies on them)
 - Course -> local folder: `course_map.json` override, else loose name match (`norm()`: lowercase,
