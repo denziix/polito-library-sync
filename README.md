@@ -33,7 +33,11 @@ How it decides what to download:
 - Missing files go into `<course>\New\`. Your own files are never moved, changed or deleted.
 - Videos/audio and files over 200 MB are skipped; only courses in your study plan are checked.
 
-## Run automatically (Task Scheduler)
+## Run on demand
+
+Double-click `Sync PoliTO.bat` (or a desktop shortcut to it). The window stays open with the result.
+
+## Run automatically (Task Scheduler, optional)
 
 Create a task: trigger every 1 hour, action "Start a program" -> `run_sync.bat`
 (or run `schtasks /Create /SC HOURLY /TN PolitoSync /TR "C:\full\path\run_sync.bat"`).
