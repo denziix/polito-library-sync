@@ -24,8 +24,14 @@ Edit `.env` with your student ID and password (git-ignored, never commit it).
 .venv\Scripts\python polito_sync.py                 # download
 ```
 
-By default files go to `Documents\Polito\<course>\...`, videos/audio and files over 200 MB are
-skipped, and only courses in your personal study plan are checked. See `.env.example`.
+How it decides what to download:
+- Each PoliTO course is matched to an existing folder in `POLITO_DOWNLOAD_DIR` by name
+  (case and punctuation ignored). Unmatched courses are skipped and named in the log; fix them by
+  renaming the folder or adding `course_map.json`, e.g. `{"PoliTO course name": "My folder"}`.
+- The whole course folder (all subfolders) is scanned; a file you already have, under any
+  subfolder, is not downloaded again (`Slides[1].pdf` and `Slides (2).pdf` count as `Slides.pdf`).
+- Missing files go into `<course>\New\`. Your own files are never moved, changed or deleted.
+- Videos/audio and files over 200 MB are skipped; only courses in your study plan are checked.
 
 ## Run automatically (Task Scheduler)
 

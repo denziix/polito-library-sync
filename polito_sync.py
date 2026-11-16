@@ -57,6 +57,15 @@ class Config:
         self.skip_mime = tuple(p.strip() for p in skip.split(",") if p.strip())
         self.max_size_mb = float(os.environ.get("POLITO_MAX_SIZE_MB", "200"))
         self.only_study_plan = os.environ.get("POLITO_ONLY_STUDY_PLAN", "1") != "0"
+        # New files go into this subfolder of each course folder ("" = course folder itself).
+        self.new_subdir = os.environ.get("POLITO_NEW_SUBFOLDER", "New").strip()
+        # Courses with no matching local folder are skipped unless this is 1.
+        self.create_missing = os.environ.get("POLITO_CREATE_MISSING_COURSE_FOLDERS", "0") == "1"
+        # Optional manual mapping: {"PoliTO course name or id": "local folder name"}
+        self.course_map: dict[str, str] = {}
+        map_file = HERE / "course_map.json"
+        if map_file.is_file():
+            self.course_map = json.loads(map_file.read_text(encoding="utf-8"))
 
     def validate(self) -> None:
         if not self.username or not self.password:
@@ -213,32 +222,91 @@ def save_state(path: Path, state: dict[str, Any]) -> None:
     os.replace(tmp, path)
 
 
+def norm(text: str) -> str:
+    """Loose key for matching course names to folder names."""
+    return re.sub(r"[^a-z0-9]", "", text.lower())
+
+
+_DUP = re.compile(r"\s*(\[\d+\]|\(\d+\))(?=\.[^.]+$|$)")
+
+
+def file_key(name: str) -> str:
+    """'Slides[1].pdf', 'Slides (2).pdf' and 'slides.pdf' all count as the same file."""
+    return _DUP.sub("", name).strip().lower()
+
+
+def resolve_course_dir(course: dict[str, Any], folders: dict[str, Path], cfg: Config) -> Path | None:
+    name = course.get("name", "")
+    mapped = cfg.course_map.get(name) or cfg.course_map.get(str(course["id"]))
+    if mapped:
+        return cfg.download_dir / mapped
+    if norm(name) in folders:
+        return folders[norm(name)]
+    if cfg.create_missing:
+        return cfg.download_dir / safe_name(name or str(course["id"]))
+    return None
+
+
+def local_index(folder: Path) -> set[str]:
+    if not folder.is_dir():
+        return set()
+    return {file_key(p.name) for p in folder.rglob("*") if p.is_file() and not p.name.endswith(".part")}
+
+
 def sync(api: PolitoApi, cfg: Config, init_only: bool = False, dry_run: bool = False) -> list[Path]:
     state_path = cfg.state_dir / "state.json"
     state = load_state(state_path)
     known: dict[str, Any] = state.setdefault("files", {})
     new_files: list[Path] = []
+    folders = (
+        {norm(p.name): p for p in cfg.download_dir.iterdir() if p.is_dir()}
+        if cfg.download_dir.is_dir() else {}
+    )
+
+    def record(key: str, f: dict[str, Any], path: Path) -> None:
+        if dry_run:
+            return
+        known[key] = {
+            "checksum": f.get("checksum"),
+            "path": str(path),
+            "seen_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        }
+        save_state(state_path, state)  # persist progress after each file
 
     for course in api.courses():
         if cfg.only_study_plan and not course.get("isInPersonalStudyPlan", True):
             continue
-        cname = safe_name(course.get("name", str(course["id"])))
+        cname = course.get("name", str(course["id"]))
+        cdir = resolve_course_dir(course, folders, cfg)
+        if cdir is None:
+            log.warning('No local folder for course "%s" (id %s): skipped. '
+                        "Create a folder with that name or add it to course_map.json.", cname, course["id"])
+            continue
         try:
             tree = api.files(course["id"])
         except requests.RequestException as exc:
             log.warning("Could not list files for %s: %s", cname, exc)
             continue
+        local = local_index(cdir)
+        present = missing = skipped = 0
         for parts, f in walk(tree):
             key = f"{course['id']}/{f['id']}"
             if known.get(key, {}).get("checksum") == f.get("checksum"):
                 continue
-            reason = skip_reason(f, cfg)
-            if reason:
-                log.debug("Skipping %s (%s)", f["name"], reason)
+            if skip_reason(f, cfg):
+                log.debug("Skipping %s (%s)", f["name"], skip_reason(f, cfg))
+                skipped += 1
                 continue
-            dest = cfg.download_dir.joinpath(cname, *parts, safe_name(f["name"]))
+            fname = safe_name(f["name"])
+            if key not in known and file_key(fname) in local:
+                present += 1  # you already have it somewhere in the course folder
+                record(key, f, cdir)
+                continue
+            missing += 1
+            base = cdir / cfg.new_subdir if cfg.new_subdir else cdir
+            dest = base.joinpath(*parts, fname)
             if init_only or dry_run:
-                log.info("%s: %s", "Would record" if dry_run else "Recorded", dest)
+                log.info("%s: %s", "Missing (would download)" if dry_run else "Recorded", dest)
             else:
                 try:
                     api.download(course["id"], f["id"], dest)
@@ -247,13 +315,9 @@ def sync(api: PolitoApi, cfg: Config, init_only: bool = False, dry_run: bool = F
                     continue
                 log.info("Downloaded %s", dest)
                 new_files.append(dest)
-            if not dry_run:
-                known[key] = {
-                    "checksum": f.get("checksum"),
-                    "path": str(dest),
-                    "seen_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                }
-                save_state(state_path, state)  # persist progress after each file
+            record(key, f, dest)
+        log.info('%s -> "%s": %d already there, %d missing, %d skipped (video/large)',
+                 cname, cdir.name, present, missing, skipped)
     return new_files
 
 
