@@ -14,7 +14,7 @@ import threading
 import tkinter as tk
 from datetime import datetime
 from pathlib import Path
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 
 import polito_sync as ps
 
@@ -41,6 +41,127 @@ class QueueHandler(logging.Handler):
 
     def emit(self, record: logging.LogRecord) -> None:
         self.q.put(("log", (record.levelno, record.getMessage())))
+
+
+ENV_PATH = ps.HERE / ".env"
+PLACEHOLDERS = {"", "s123456", "your-password"}
+
+
+def read_env() -> dict[str, str]:
+    vals: dict[str, str] = {}
+    if ENV_PATH.is_file():
+        for raw in ENV_PATH.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, _, v = line.partition("=")
+                vals[k.strip()] = v.strip()
+    return vals
+
+
+def write_env(updates: dict[str, str]) -> None:
+    """Update keys in .env, keeping every other line (comments, options) as it was."""
+    lines = ENV_PATH.read_text(encoding="utf-8").splitlines() if ENV_PATH.is_file() else []
+    done = set()
+    out = []
+    for raw in lines:
+        key = raw.split("=", 1)[0].strip().lstrip("#").strip()
+        if key in updates and "=" in raw and key not in done:
+            out.append(f"{key}={updates[key]}")
+            done.add(key)
+        else:
+            out.append(raw)
+    out += [f"{k}={v}" for k, v in updates.items() if k not in done]
+    ENV_PATH.write_text("\n".join(out) + "\n", encoding="utf-8")
+    os.environ.update(updates)
+
+
+def needs_setup() -> bool:
+    v = read_env()
+    return v.get("POLITO_USERNAME", "") in PLACEHOLDERS or v.get("POLITO_PASSWORD", "") in PLACEHOLDERS
+
+
+class SettingsDialog(tk.Toplevel):
+    def __init__(self, master: "App", first_run: bool = False) -> None:
+        super().__init__(master)
+        self.app = master
+        self.title("PoliTO Sync - Settings")
+        self.configure(bg="white")
+        self.resizable(False, False)
+        self.transient(master)
+        cur = read_env()
+        cfg = master.cfg
+
+        frm = ttk.Frame(self, padding=22)
+        frm.pack(fill="both", expand=True)
+        intro = ("Welcome! Enter your PoliTO login and choose where course files should go."
+                 if first_run else "Change your login or download folder.")
+        ttk.Label(frm, text=intro, wraplength=440, font=(FONT, 10)).grid(row=0, column=0, columnspan=3,
+                                                                          sticky="w", pady=(0, 14))
+
+        def label(row: int, text: str, hint: str = "") -> None:
+            ttk.Label(frm, text=text, font=(FONT, 10, "bold")).grid(row=row, column=0, sticky="w", pady=(6, 0))
+            if hint:
+                ttk.Label(frm, text=hint, foreground=MUTED, font=(FONT, 8)).grid(row=row + 1, column=0,
+                                                                                 columnspan=3, sticky="w")
+
+        user = cur.get("POLITO_USERNAME", "")
+        self.user = tk.StringVar(value="" if user in PLACEHOLDERS else user)
+        pw = cur.get("POLITO_PASSWORD", "")
+        self.pw = tk.StringVar(value="" if pw in PLACEHOLDERS else pw)
+        self.folder = tk.StringVar(value=str(cfg.download_dir))
+        self.create = tk.BooleanVar(value=cfg.create_missing or first_run)
+
+        label(1, "Student ID", "e.g. s123456")
+        ttk.Entry(frm, textvariable=self.user, width=44).grid(row=1, column=1, columnspan=2, sticky="we", pady=(6, 0))
+        label(3, "Password", "Stored only on this PC, in the .env file next to the app.")
+        self.pw_entry = ttk.Entry(frm, textvariable=self.pw, width=44, show="•")
+        self.pw_entry.grid(row=3, column=1, sticky="we", pady=(6, 0))
+        self.show = tk.BooleanVar(value=False)
+        ttk.Checkbutton(frm, text="Show", variable=self.show,
+                        command=lambda: self.pw_entry.configure(show="" if self.show.get() else "•")
+                        ).grid(row=3, column=2, padx=(8, 0), pady=(6, 0))
+        label(5, "Download folder", "The folder that holds (or will hold) one subfolder per course.")
+        ttk.Entry(frm, textvariable=self.folder, width=36).grid(row=5, column=1, sticky="we", pady=(6, 0))
+        ttk.Button(frm, text="Browse…", command=self._browse).grid(row=5, column=2, padx=(8, 0), pady=(6, 0))
+        ttk.Checkbutton(frm, text="Create a folder for each course automatically\n"
+                                  "(untick if you already made your own course folders)",
+                        variable=self.create).grid(row=7, column=0, columnspan=3, sticky="w", pady=(14, 0))
+
+        btns = ttk.Frame(frm)
+        btns.grid(row=8, column=0, columnspan=3, sticky="e", pady=(20, 0))
+        ttk.Button(btns, text="Cancel", command=self.destroy).pack(side="right", padx=(8, 0))
+        ttk.Button(btns, text="Save", style="Accent.TButton", command=self._save).pack(side="right")
+        self.bind("<Return>", lambda _e: self._save())
+        self.update_idletasks()
+        x = master.winfo_rootx() + (master.winfo_width() - self.winfo_width()) // 2
+        y = master.winfo_rooty() + (master.winfo_height() - self.winfo_height()) // 3
+        self.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        self.grab_set()
+        self.focus_force()
+
+    def _browse(self) -> None:
+        start = self.folder.get() if Path(self.folder.get()).is_dir() else str(Path.home())
+        chosen = filedialog.askdirectory(parent=self, initialdir=start, title="Choose your course folder")
+        if chosen:
+            self.folder.set(str(Path(chosen)))
+
+    def _save(self) -> None:
+        user, pw, folder = self.user.get().strip(), self.pw.get(), self.folder.get().strip()
+        if not user or not pw:
+            messagebox.showwarning("PoliTO Sync", "Please enter your student ID and password.", parent=self)
+            return
+        if not folder:
+            messagebox.showwarning("PoliTO Sync", "Please choose a download folder.", parent=self)
+            return
+        Path(folder).mkdir(parents=True, exist_ok=True)
+        write_env({
+            "POLITO_USERNAME": user,
+            "POLITO_PASSWORD": pw,
+            "POLITO_DOWNLOAD_DIR": folder,
+            "POLITO_CREATE_MISSING_COURSE_FOLDERS": "1" if self.create.get() else "0",
+        })
+        self.app.reload_config()
+        self.destroy()
 
 
 class App(tk.Tk):
@@ -72,6 +193,13 @@ class App(tk.Tk):
         self._build()
         self._show_last_run()
         self.after(100, self._poll)
+        if needs_setup():
+            self.after(300, lambda: SettingsDialog(self, first_run=True))
+
+    def reload_config(self) -> None:
+        self.cfg = ps.Config()
+        self.sub.configure(text=f"Course files  →  {self.cfg.download_dir}")
+        self._log("Settings saved.", "muted")
 
     # ------------------------------------------------------------------ setup
     def _setup_logging(self) -> None:
@@ -107,7 +235,8 @@ class App(tk.Tk):
         head = ttk.Frame(self, style="Header.TFrame", padding=(18, 14))
         head.pack(fill="x")
         ttk.Label(head, text="PoliTO Sync", style="Title.TLabel").pack(anchor="w")
-        ttk.Label(head, text=f"Course files  →  {self.cfg.download_dir}", style="Sub.TLabel").pack(anchor="w")
+        self.sub = ttk.Label(head, text=f"Course files  →  {self.cfg.download_dir}", style="Sub.TLabel")
+        self.sub.pack(anchor="w")
 
         # Status bar (packed early so it always stays visible at the bottom)
         self.status = ttk.Label(self, text="Ready.", style="Status.TLabel", anchor="w")
@@ -122,6 +251,8 @@ class App(tk.Tk):
         self.btn_sync.pack(side="left")
         self.btn_check.pack(side="left", padx=8)
         self.btn_open.pack(side="left")
+        self.btn_settings = ttk.Button(bar, text="⚙  Settings", command=lambda: SettingsDialog(self))
+        self.btn_settings.pack(side="left", padx=8)
         self.progress = ttk.Progressbar(bar, length=200, mode="determinate")
         self.progress.pack(side="right")
 
@@ -187,7 +318,7 @@ class App(tk.Tk):
     def _set_busy(self, busy: bool) -> None:
         self.busy = busy
         state = "disabled" if busy else "normal"
-        for b in (self.btn_check, self.btn_sync):
+        for b in (self.btn_check, self.btn_sync, self.btn_settings):
             b.configure(state=state)
         self.configure(cursor="watch" if busy else "")
 
