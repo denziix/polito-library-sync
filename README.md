@@ -33,9 +33,11 @@ How it decides what to download:
 - Missing files go into `<course>\New\`. Your own files are never moved, changed or deleted.
 - Videos/audio and files over 200 MB are skipped; only courses in your study plan are checked.
 
-## Run on demand
+## Run on demand (app window)
 
-Double-click `Sync PoliTO.bat` (or a desktop shortcut to it). The window stays open with the result.
+Double-click `Create desktop shortcut.bat` once; then open **PoliTO Sync** from your Desktop.
+**Check** previews what is missing, **Sync now** downloads it, double-click a course to open its folder.
+`Sync PoliTO.bat` opens the same window. The command line (`polito_sync.py`) still works too.
 
 ## Run automatically (Task Scheduler, optional)
 

@@ -15,7 +15,7 @@ import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 from urllib.parse import urljoin, urlparse
 
 import requests
@@ -253,7 +253,13 @@ def local_index(folder: Path) -> set[str]:
     return {file_key(p.name) for p in folder.rglob("*") if p.is_file() and not p.name.endswith(".part")}
 
 
-def sync(api: PolitoApi, cfg: Config, init_only: bool = False, dry_run: bool = False) -> list[Path]:
+Progress = Callable[[str, Any], None]
+
+
+def sync(api: PolitoApi, cfg: Config, init_only: bool = False, dry_run: bool = False,
+         progress: Progress | None = None) -> list[Path]:
+    """progress(event, data) is called with ("courses", n), ("course", stats) and ("file", path)."""
+    emit = progress or (lambda *_: None)
     state_path = cfg.state_dir / "state.json"
     state = load_state(state_path)
     known: dict[str, Any] = state.setdefault("files", {})
@@ -273,19 +279,23 @@ def sync(api: PolitoApi, cfg: Config, init_only: bool = False, dry_run: bool = F
         }
         save_state(state_path, state)  # persist progress after each file
 
-    for course in api.courses():
-        if cfg.only_study_plan and not course.get("isInPersonalStudyPlan", True):
-            continue
+    courses = [c for c in api.courses()
+               if not cfg.only_study_plan or c.get("isInPersonalStudyPlan", True)]
+    emit("courses", len(courses))
+    for course in courses:
         cname = course.get("name", str(course["id"]))
         cdir = resolve_course_dir(course, folders, cfg)
         if cdir is None:
             log.warning('No local folder for course "%s" (id %s): skipped. '
                         "Create a folder with that name or add it to course_map.json.", cname, course["id"])
+            emit("course", {"name": cname, "folder": None, "present": 0, "missing": 0, "skipped": 0})
             continue
         try:
             tree = api.files(course["id"])
         except requests.RequestException as exc:
             log.warning("Could not list files for %s: %s", cname, exc)
+            emit("course", {"name": cname, "folder": str(cdir), "error": str(exc),
+                            "present": 0, "missing": 0, "skipped": 0})
             continue
         local = local_index(cdir)
         present = missing = skipped = 0
@@ -315,9 +325,12 @@ def sync(api: PolitoApi, cfg: Config, init_only: bool = False, dry_run: bool = F
                     continue
                 log.info("Downloaded %s", dest)
                 new_files.append(dest)
+                emit("file", str(dest))
             record(key, f, dest)
         log.info('%s -> "%s": %d already there, %d missing, %d skipped (video/large)',
                  cname, cdir.name, present, missing, skipped)
+        emit("course", {"name": cname, "folder": str(cdir), "present": present,
+                        "missing": missing, "skipped": skipped})
     return new_files
 
 
