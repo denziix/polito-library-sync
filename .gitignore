@@ -221,3 +221,6 @@ __marimo__/
 
 # polito-library-sync runtime data (login token, state, logs)
 data/
+
+# personal Claude Code notes
+CLAUDE.local.md
