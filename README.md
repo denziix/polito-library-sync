@@ -1,57 +1,45 @@
-# polito-library-sync
+# PoliTO Sync
 
-Automatically downloads new course files from the PoliTO teaching portal into a local folder.
-It uses the official PoliTO Students API (https://github.com/polito/api-spec) and only fetches
-files it has not seen before (or whose checksum changed).
+A small Windows app that downloads new course files from the Politecnico di Torino teaching portal
+into your own folders. Click **Check** to see what's new, **Sync now** to download it.
+It uses the official PoliTO Students API (https://github.com/polito/api-spec).
 
-## Setup (Windows)
+## Install (Windows, 5 minutes)
 
-```bat
-git clone https://github.com/denziix/polito-library-sync
-cd polito-library-sync
-python -m venv .venv
-.venv\Scripts\pip install -r requirements.txt
-copy .env.example .env
-```
+1. **Install Python** from https://www.python.org/downloads/windows/ — pick the
+   **"Windows installer (64-bit)"**. On the first screen tick **"Add python.exe to PATH"**.
+2. **Download this app**: on this GitHub page click the green **Code** button → **Download ZIP**,
+   then unzip it somewhere (e.g. `Documents\PoliTO Sync`).
+3. Double-click **`Setup.bat`** in the unzipped folder. When Notepad opens, enter your PoliTO
+   student ID (`s123456`) and password, save and close.
+4. Open **PoliTO Sync** from your Desktop.
 
-Edit `.env` with your student ID and password (git-ignored, never commit it).
+Your password is stored only in the `.env` file on your own PC, in plain text. Don't share that file.
 
-## First run
+## How it works
 
-```bat
-.venv\Scripts\python polito_sync.py --dry-run -v    # preview only
-.venv\Scripts\python polito_sync.py --init-only     # (optional) mark everything as already seen
-.venv\Scripts\python polito_sync.py                 # download
-```
+- Each PoliTO course gets a folder in your download folder (default `Documents\Polito`).
+  If you already have your own course folders, set `POLITO_DOWNLOAD_DIR` to their parent folder in
+  `.env`; folders are matched by course name (capitals and punctuation ignored). A course with no
+  matching folder shows in orange; rename the folder or add `course_map.json`:
+  `{"PoliTO course name": "My folder name"}`.
+- Before downloading, the course folder (all subfolders) is scanned: files you already have are
+  skipped (`Slides[1].pdf` and `Slides (2).pdf` count as `Slides.pdf`).
+- New files go into `<course>\New\`. Your own files are never moved, changed or deleted.
+- Each file is remembered (`data\state.json`), so it's never downloaded twice, even if you move or
+  rename it. It's downloaded again only if the professor uploads a changed version.
+- Videos/audio and files over 200 MB are skipped by default. All options are in `.env`.
 
-How it decides what to download:
-- Each PoliTO course is matched to an existing folder in `POLITO_DOWNLOAD_DIR` by name
-  (case and punctuation ignored). Unmatched courses are skipped and named in the log; fix them by
-  renaming the folder or adding `course_map.json`, e.g. `{"PoliTO course name": "My folder"}`.
-- The whole course folder (all subfolders) is scanned; a file you already have, under any
-  subfolder, is not downloaded again (`Slides[1].pdf` and `Slides (2).pdf` count as `Slides.pdf`).
-- Missing files go into `<course>\New\`. Your own files are never moved, changed or deleted.
-- Videos/audio and files over 200 MB are skipped; only courses in your study plan are checked.
+## Troubleshooting
 
-## Run on demand (app window)
+- **Login failed**: check student ID and password in `.env`.
+- **The window doesn't open**: in the app folder run `.venv\Scripts\python polito_gui.pyw` in a
+  Command Prompt to see the error. `No module named tkinter` → re-run the Python installer,
+  choose *Modify* and tick *tcl/tk*.
+- Full log: `data\sync.log`.
 
-Double-click `Create desktop shortcut.bat` once; then open **PoliTO Sync** from your Desktop.
-**Check** previews what is missing, **Sync now** downloads it, double-click a course to open its folder.
-`Sync PoliTO.bat` opens the same window. The command line (`polito_sync.py`) still works too.
+## For developers
 
-## Run automatically (Task Scheduler, optional)
-
-Create a task: trigger every 1 hour, action "Start a program" -> `run_sync.bat`
-(or run `schtasks /Create /SC HOURLY /TN PolitoSync /TR "C:\full\path\run_sync.bat"`).
-
-## Tests
-
-```bat
-python -m unittest discover -s tests
-```
-
-## Notes
-
-- Login uses your username and password. If PoliTO requires MFA for this login type, login will
-  fail with a clear error; see the log in `data\sync.log`.
-- Runtime data (login token, state, log) lives in `data/`, which is git-ignored.
+Command line: `.venv\Scripts\python polito_sync.py [--dry-run] [--init-only] [-v]`.
+Tests: `python -m unittest discover -s tests`.
+Unofficial tool, not affiliated with Politecnico di Torino. Use at your own risk.
