@@ -157,7 +157,33 @@ def emoji(char: str, size: int) -> "ImageTk.PhotoImage | None":
     return ImageTk.PhotoImage(img)
 
 
+@lru_cache(maxsize=24)
+def checkbox(size: int, state: str, fill: str, border: str, gradient: tuple[str, ...]) -> "ImageTk.PhotoImage | None":
+    """A rounded tick box for the file picker: state 'on' (tick), 'some' (dash) or 'off' (empty box).
+    A little transparent space on the right keeps it off the text next to it."""
+    if Image is None:
+        return None
+    W = size * 4
+    big = Image.new("RGBA", (W, W), (0, 0, 0, 0))
+    mask = _mask(W, W, W // 4)
+    d = ImageDraw.Draw(big)
+    if state == "off":
+        big.paste(Image.new("RGB", (W, W), rgb(fill)), (0, 0), mask)
+        d.rounded_rectangle((2, 2, W - 3, W - 3), W // 4, outline=rgb(border), width=max(4, W // 10))
+    else:
+        big.paste(_gradient(W, W, gradient), (0, 0), mask)
+        lw = max(4, W // 8)
+        if state == "on":
+            d.line([(W * 0.25, W * 0.52), (W * 0.43, W * 0.70), (W * 0.76, W * 0.32)], fill=(255, 255, 255),
+                   width=lw, joint="curve")
+        else:
+            d.line([(W * 0.27, W * 0.5), (W * 0.73, W * 0.5)], fill=(255, 255, 255), width=lw)
+    out = Image.new("RGBA", (size + 8, size), (0, 0, 0, 0))
+    out.paste(big.resize((size, size), Image.LANCZOS), (0, 0))
+    return ImageTk.PhotoImage(out)
+
+
 def clear_cache() -> None:
     """Drop cached images (after a theme change, or when a new Tk root is created)."""
-    for fn in (rounded, corners, hero, emoji):
+    for fn in (rounded, corners, hero, emoji, checkbox):
         fn.cache_clear()

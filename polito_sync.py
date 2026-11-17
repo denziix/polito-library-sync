@@ -196,13 +196,18 @@ def safe_name(name: str) -> str:
     return cleaned[:150] or "unnamed"
 
 
-def walk(entries: list[dict[str, Any]], parts: tuple[str, ...] = ()) -> Iterator[tuple[tuple[str, ...], dict[str, Any]]]:
-    """Yield (directory parts, file entry) for every file in a course tree."""
+def dir_id(entry: dict[str, Any]) -> str:
+    return str(entry.get("id") or entry.get("name", ""))
+
+
+def walk(entries: list[dict[str, Any]], parts: tuple[str, ...] = (), dirs: tuple[str, ...] = ()
+         ) -> Iterator[tuple[tuple[str, ...], tuple[str, ...], dict[str, Any]]]:
+    """Yield (folder names, folder ids, file entry) for every file in a course tree."""
     for e in entries:
         if e.get("type") == "directory":
-            yield from walk(e.get("files", []), parts + (safe_name(e["name"]),))
+            yield from walk(e.get("files", []), parts + (safe_name(e["name"]),), dirs + (dir_id(e),))
         elif e.get("type") == "file":
-            yield parts, e
+            yield parts, dirs, e
 
 
 def skip_reason(f: dict[str, Any], cfg: Config) -> str | None:
@@ -213,6 +218,90 @@ def skip_reason(f: dict[str, Any], cfg: Config) -> str | None:
     if cfg.max_size_mb and size_mb > cfg.max_size_mb:
         return f"{size_mb:.0f} MB > limit"
     return None
+
+
+def off_label(f: dict[str, Any], cfg: Config) -> str | None:
+    """Why a file is off by default, in words for the picker: 'video', 'audio' or 'over 200 MB'."""
+    reason = skip_reason(f, cfg)
+    if reason is None:
+        return None
+    if reason.startswith("mime"):
+        return f.get("mimeType", "").split("/")[0] or "media"
+    return f"over {cfg.max_size_mb:g} MB"
+
+
+# --------------------------------------------------------------------------
+# Your picks (detailed download mode)
+# --------------------------------------------------------------------------
+# data/choices.json maps a course, folder or file to true (download) or false (skip). A file follows its
+# own pick, else the pick of its nearest folder, else its course's, else the default (download, except
+# videos/audio and big files). Every sync respects the picks, so something you untick stays skipped
+# (including files added to an unticked folder later) until you tick it again.
+def course_pick_key(course_id: Any) -> str:
+    return str(course_id)
+
+
+def dir_pick_key(course_id: Any, folder_id: str) -> str:
+    return f"{course_id}/d{folder_id}"
+
+
+def file_pick_key(course_id: Any, file_id: Any) -> str:
+    return f"{course_id}/f{file_id}"
+
+
+def pick_chain(course_id: Any, dirs: tuple[str, ...], file_id: Any) -> list[str]:
+    """The keys that decide a file, most specific first: the file, its folders (innermost first), its course."""
+    return [file_pick_key(course_id, file_id), *(dir_pick_key(course_id, d) for d in reversed(dirs)),
+            course_pick_key(course_id)]
+
+
+def picked(picks: dict[str, bool], chain: list[str], default: bool) -> bool:
+    for key in chain:
+        if key in picks:
+            return picks[key]
+    return default
+
+
+def load_picks(cfg: Config) -> dict[str, bool]:
+    try:
+        data = json.loads((cfg.state_dir / "choices.json").read_text(encoding="utf-8"))
+        return {str(k): bool(v) for k, v in data.get("picks", {}).items()}
+    except (OSError, ValueError, AttributeError):
+        return {}
+
+
+def save_picks(cfg: Config, picks: dict[str, bool]) -> None:
+    save_state(cfg.state_dir / "choices.json", {"picks": dict(sorted(picks.items()))})
+
+
+def node_files(node: dict[str, Any]) -> Iterator[dict[str, Any]]:
+    """Every file node in (or equal to) a node from scan()."""
+    if node["type"] == "file":
+        yield node
+    for child in node.get("children", []):
+        yield from node_files(child)
+
+
+def _node_keys(node: dict[str, Any]) -> Iterator[str]:
+    yield node["key"]
+    for child in node.get("children", []):
+        yield from _node_keys(child)
+
+
+def set_pick(picks: dict[str, bool], node: dict[str, Any], value: bool) -> None:
+    """Tick (True) or untick (False) a course, folder or file node from scan(), the way the picker does.
+
+    The node's pick replaces the picks of everything inside it. A pick that changes nothing (the files
+    would get that value anyway) is left out, so unticking and ticking again restores the defaults.
+    """
+    for key in _node_keys(node):
+        picks.pop(key, None)
+    if node["type"] == "course":  # also folders inside it that have nothing new right now
+        prefix = node["key"] + "/"
+        for key in [k for k in picks if k.startswith(prefix)]:
+            del picks[key]
+    if any(picked(picks, f["chain"], f["default"]) != value for f in node_files(node)):
+        picks[node["key"]] = value
 
 
 def load_state(path: Path) -> dict[str, Any]:
@@ -319,6 +408,7 @@ def sync(api: PolitoApi, cfg: Config, init_only: bool = False, dry_run: bool = F
         }
         save_state(state_path, state)  # persist progress after each file
 
+    picks = load_picks(cfg)
     courses = study_plan_courses(api, cfg)
     if cfg.create_missing and not dry_run:
         create_course_folders(cfg, courses)  # every course gets a folder, even one with no files yet
@@ -341,12 +431,13 @@ def sync(api: PolitoApi, cfg: Config, init_only: bool = False, dry_run: bool = F
             continue
         local = local_index(cdir)
         present = missing = skipped = 0
-        for parts, f in walk(tree):
+        for parts, dirs, f in walk(tree):
             key = f"{course['id']}/{f['id']}"
             if known.get(key, {}).get("checksum") == f.get("checksum"):
                 continue
-            if skip_reason(f, cfg):
-                log.debug("Skipping %s (%s)", f["name"], skip_reason(f, cfg))
+            reason = skip_reason(f, cfg)
+            if not picked(picks, pick_chain(course["id"], dirs, f["id"]), reason is None):
+                log.debug("Skipping %s (%s)", f["name"], reason or "unticked")
                 skipped += 1
                 continue
             fname = safe_name(f["name"])
@@ -369,11 +460,66 @@ def sync(api: PolitoApi, cfg: Config, init_only: bool = False, dry_run: bool = F
                 new_files.append(dest)
                 emit("file", str(dest))
             record(key, f, dest)
-        log.info('%s -> "%s": %d already there, %d missing, %d skipped (video/large)',
+        log.info('%s -> "%s": %d already there, %d missing, %d skipped (video/large/unticked)',
                  cname, cdir.name, present, missing, skipped)
         emit("course", {"name": cname, "folder": str(cdir), "present": present,
                         "missing": missing, "skipped": skipped})
     return new_files
+
+
+def scan(api: PolitoApi, cfg: Config, progress: Progress | None = None) -> list[dict[str, Any]]:
+    """What a sync could download, for the picker of detailed download mode. Changes nothing.
+
+    One node per course with files you don't have yet: {"type": "course", "key", "name", "children"}.
+    Folders: {"type": "directory", "key", "name", "children"}. Files: {"type": "file", "key", "name",
+    "size_kb", "chain", "default", "off" (why it's off by default, or None), "updated"}. Files you
+    already have, and folders with nothing new in them, are left out. Courses sync would skip (no local
+    folder) are left out too. progress gets ("courses", n) and ("scan", course name).
+    """
+    emit = progress or (lambda *_: None)
+    known: dict[str, Any] = load_state(cfg.state_dir / "state.json").get("files", {})
+    courses = study_plan_courses(api, cfg)
+    folders = local_folders(cfg)
+    emit("courses", len(courses))
+    out: list[dict[str, Any]] = []
+    for course in courses:
+        cid, cname = course["id"], course.get("name", str(course["id"]))
+        emit("scan", cname)
+        cdir = resolve_course_dir(course, folders, cfg)
+        if cdir is None:
+            continue
+        try:
+            tree = api.files(cid)
+        except requests.RequestException as exc:
+            log.warning("Could not list files for %s: %s", cname, exc)
+            continue
+        local = local_index(cdir)
+
+        def build(entries: list[dict[str, Any]], dirs: tuple[str, ...]) -> list[dict[str, Any]]:
+            nodes: list[dict[str, Any]] = []
+            for e in entries:
+                if e.get("type") == "directory":
+                    did = dir_id(e)
+                    kids = build(e.get("files", []), dirs + (did,))
+                    if kids:
+                        nodes.append({"type": "directory", "key": dir_pick_key(cid, did),
+                                      "name": e.get("name") or did, "children": kids})
+                elif e.get("type") == "file":
+                    key = f"{cid}/{e['id']}"
+                    if known.get(key, {}).get("checksum") == e.get("checksum"):
+                        continue  # downloaded (or recorded) already
+                    if key not in known and file_key(safe_name(e["name"])) in local:
+                        continue  # you already have it somewhere in the course folder
+                    nodes.append({"type": "file", "key": file_pick_key(cid, e["id"]), "name": e["name"],
+                                  "size_kb": e.get("sizeInKiloBytes", 0), "chain": pick_chain(cid, dirs, e["id"]),
+                                  "default": skip_reason(e, cfg) is None, "off": off_label(e, cfg),
+                                  "updated": key in known})
+            return nodes
+
+        kids = build(tree, ())
+        if kids:
+            out.append({"type": "course", "key": course_pick_key(cid), "name": cname, "children": kids})
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -495,7 +641,8 @@ _DATE_RES = [
     (re.compile(rf"\b(\d{{1,2}})(?:st|nd|rd|th|°)?\s+(?:of\s+)?({_MON})\b\.?(?:,?\s+(\d{{4}}))?", re.I), "d_mon"),
     (re.compile(rf"\b({_MON})\b\.?\s+(\d{{1,2}})(?:st|nd|rd|th)?\b(?:,?\s+(\d{{4}}))?", re.I), "mon_d"),
 ]
-_TIME_RE = re.compile(r"\b([01]?\d|2[0-3])[:.]([0-5]\d)\b|\b(1[0-2]|0?[1-9])\s*([ap])\.?m\b\.?", re.I)
+_TIME_RE = re.compile(r"\b([01]?\d|2[0-3])[:.]([0-5]\d)\b|\b(1[0-2]|0?[1-9])\s*([ap])\.?m\b\.?|"
+                      r"\b(?:ore|alle|dalle|h)\s*([01]?\d|2[0-3])\b(?![:.]\d)", re.I)
 _RELATIVE = {"today": 0, "oggi": 0, "tomorrow": 1, "domani": 1}
 
 # (label, keywords). The first matching label wins, so the more specific ones come first.
@@ -578,18 +725,116 @@ def find_time(text: str) -> str | None:
         return None
     if mt.group(1):
         return f"{int(mt.group(1)):02d}:{mt.group(2)}"
+    if mt.group(5):  # "ore 15"
+        return f"{int(mt.group(5)):02d}:00"
     h = int(mt.group(3)) % 12 + (12 if mt.group(4).lower() == "p" else 0)
     return f"{h:02d}:00"
 
 
-_SENT_SPLIT = re.compile(r"\n+|(?<=[.!?])\s+(?=[A-ZÀ-Ü•])")
+_SENT_SPLIT = re.compile(r"\n+|(?<![Pp]rof\.)(?<!Dr\.)(?<!Mr\.)(?<!Ms\.)(?<!Mrs\.)(?<!Ing\.)(?<!Dott\.)"
+                         r"(?<!e\.g\.)(?<!i\.e\.)(?<!\b[A-Z]\.)(?<=[.!?])\s+(?=[A-ZÀ-Ü•])")
+# Openers and sign-offs that say nothing about the notice ("Goodmorning,", "Dear all,", "Cari studenti,",
+# "Best regards", "Cordiali saluti", "Prof. Rossi").
+_GREETING = re.compile(
+    r"(dear|hello|hi|hey|greetings|good\s*(morning|afternoon|evening|day)|buon\s*(giorno|pomeriggio)|"
+    r"buona\s*sera|salve|ciao|(car|gentil|carissim)[ie]\s+(student|tutt|ragazz|allievi|colleg))"
+    r"(?=[\s,.!:;]|$)", re.I)
+_SIGN_OFF = re.compile(
+    r"(((best|kind|warm|many)\s+)?regards|best(\s+wishes)?$|all the best|thanks?\b|thank you|cheers|see you|"
+    r"sincerely|yours|((cordiali|distinti|tanti|cari)\s+)?salut|un saluto|a presto|grazie|"
+    r"buon[oa]?\s+(lavoro|studio|giornata))", re.I)
+_SIGNATURE = re.compile(r"(prof\b|prof\.|professor|dr\b|dr\.|the teach|(il|la|i|le)\s+docent)", re.I)
+_INITIALS_NAME = re.compile(r"(?:[A-Z]\.\s*){1,3}[A-Za-z][\w'’.-]*(?:\s+[A-Z][\w'’-]*)?")  # "A. Tonoli"
+_PLEASANTRY = re.compile(r"(i\s+)?hope (you are|you're|this (e-?mail|message) finds you|everything is)|"
+                         r"spero (che )?(stiate|state|tutto)", re.I)
+
+
+def strip_greeting(text: str) -> str:
+    """'Goodmorning, the lab moves to...' -> 'the lab moves to...'; 'Dear students,' -> ''."""
+    m = _GREETING.match(text)
+    if not m:
+        return text
+    rest = text[m.end():]
+    cut = re.search(r"[,:;!.]", rest[:60])  # the end of "Dear students of the course,"
+    if cut:
+        return rest[cut.end():].strip()
+    return "" if len(rest.strip()) < 40 else text
+
+
+def _filler(sentence: str) -> bool:
+    """A greeting, pleasantry, sign-off or signature on its own: nothing worth showing."""
+    short = len(sentence) < 60
+    return (not strip_greeting(sentence)
+            or (short and (_SIGN_OFF.match(sentence) or _PLEASANTRY.match(sentence)) is not None)
+            or (len(sentence.split()) <= 5 and _SIGNATURE.match(sentence) is not None)
+            or _INITIALS_NAME.fullmatch(sentence) is not None)
+
+
+def _cap(text: str) -> str:
+    return text[:1].upper() + text[1:]
+
+
+def _sentences(text: str) -> list[str]:
+    return [s for s in (raw.strip(" •\t") for raw in _SENT_SPLIT.split(text)) if s]
+
+
+def _join(parts: list[str]) -> str:
+    """Sentences -> one line; lines without their own full stop are separated with a dot."""
+    out = ""
+    for part in parts:
+        out += ("" if not out else " " if out[-1] in ".!?:;," else " · ") + part
+    return out
+
+
+def notice_title(text: str) -> str | None:
+    """A notice's first line, when it reads like a title ('SEMINAR ALERT', 'LAIB practice 2')."""
+    lines = [ln.strip(" •\t") for ln in text.splitlines() if ln.strip(" •\t")]
+    if len(lines) < 2:
+        return None
+    first = lines[0]
+    if (len(first) > 70 or len(first.split()) > 9 or first[-1] in ".,;:!?" or _filler(first)
+            or _GREETING.match(first)):
+        return None
+    return first
+
+
+def notice_preview(text: str) -> str:
+    """One line for the notices list: the title (when there is one) and the gist, without greetings."""
+    title, gist = notice_title(text), notice_gist(text, 160)
+    if title:
+        return f"{title} · {gist}" if gist and gist != title else title
+    return gist or "(empty)"
+
+
+def notice_gist(text: str, limit: int = 240) -> str:
+    """The start of a notice without its greeting and title, for cards."""
+    sents = _sentences(text)
+    title = notice_title(text)
+    keep = [strip_greeting(s) if i < 2 else s for i, s in enumerate(sents)]
+    keep = [s for s in keep if s and not _filler(s) and s != title]
+    return _clip(_cap(_join(keep)), limit) if keep else _clip(text, limit)
+
+
+def _event_snippet(sents: list[str], i: int) -> str:
+    """The sentence with the date, plus enough around it to make sense on its own: a lead-in line that
+    ends with ':' before it, and the next sentence or two when it's short. Greetings and sign-offs never."""
+    parts = [(strip_greeting(sents[i]) if i < 2 else sents[i]) or sents[i]]
+    if i > 0 and sents[i - 1].endswith(":") and not _filler(sents[i - 1]):
+        parts.insert(0, strip_greeting(sents[i - 1]) or sents[i - 1])
+    for nxt in sents[i + 1:i + 3]:
+        if len(_join(parts)) >= 100:
+            break
+        if not _filler(nxt):
+            parts.append(nxt)
+    return _clip(_cap(_join(parts)))
 
 
 def extract_events(notices: list[dict[str, Any]], today: date, horizon_days: int = 120,
                    heads_up_days: int = 14) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Upcoming events found in notices, and recent important notices without a usable date.
 
-    Returns (events, heads_up). An event: date, time, kind, course, snippet, notice_id, publishedAt.
+    Returns (events, heads_up). An event: date, time, kind, course, title (or None), snippet, notice_id,
+    publishedAt.
     """
     events: list[dict[str, Any]] = []
     heads_up: list[dict[str, Any]] = []
@@ -599,11 +844,10 @@ def extract_events(notices: list[dict[str, Any]], today: date, horizon_days: int
         pub = parse_dt(n.get("publishedAt"))
         ref = pub.date() if pub else today
         notice_kind = classify(text)
+        title = notice_title(text)
         got_future = False
-        for sent in _SENT_SPLIT.split(text):
-            sent = sent.strip(" •\t")
-            if not sent:
-                continue
+        sents = _sentences(text)
+        for i, sent in enumerate(sents):
             for dt, s, e in find_dates(sent, ref):
                 if not today <= dt <= today + timedelta(days=horizon_days):
                     continue
@@ -617,14 +861,14 @@ def extract_events(notices: list[dict[str, Any]], today: date, horizon_days: int
                     kind = notice_kind
                 events.append({
                     "date": dt, "time": find_time(sent[:s] + " " + sent[e:]), "kind": kind,
-                    "course": n.get("course", ""), "snippet": _clip(sent),
+                    "course": n.get("course", ""), "title": title, "snippet": _event_snippet(sents, i),
                     "notice_id": n.get("id"), "courseId": n.get("courseId"),
                     "publishedAt": n.get("publishedAt"),
                 })
         recent = pub is not None and pub.date() >= today - timedelta(days=heads_up_days)
         if not got_future and recent and notice_kind in IMPORTANT_KINDS:
-            heads_up.append({"kind": notice_kind, "course": n.get("course", ""),
-                             "snippet": _clip(text.replace("\n", " ")), "notice_id": n.get("id"),
+            heads_up.append({"kind": notice_kind, "course": n.get("course", ""), "title": title,
+                             "snippet": notice_gist(text), "notice_id": n.get("id"),
                              "courseId": n.get("courseId"), "publishedAt": n.get("publishedAt")})
     events.sort(key=lambda ev: (ev["date"], ev["time"] or "99:99", ev["course"]))
     return events, heads_up

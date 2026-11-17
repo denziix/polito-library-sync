@@ -31,13 +31,19 @@ Your password is stored only in the `.env` file on your own PC, in plain text. D
   punctuation ignored). A course with no matching folder shows in orange; rename the folder or
   add `course_map.json`: `{"PoliTO course name": "My folder name"}`.
 - Besides files, the app shows your courses' **notices** and an **upcoming** page with the
-  seminars, exams, deadlines and class changes it finds in them.
+  seminars, exams, deadlines and class changes it finds in them (read from the notice text on your PC,
+  no AI needed; greetings like "Good morning," and sign-offs are left out).
 - Before downloading, the course folder (all subfolders) is scanned: files you already have are
   skipped (`Slides[1].pdf` and `Slides (2).pdf` count as `Slides.pdf`).
 - New files go into `<course>\New\`. Your own files are never moved, changed or deleted.
 - Each file is remembered (`data\state.json`), so it's never downloaded twice, even if you move or
   rename it. It's downloaded again only if the professor uploads a changed version.
 - Videos/audio and files over 200 MB are skipped by default. All options are in `.env`.
+- **Detailed download mode** (switch on the Files page): **sync now** first shows everything new, by
+  course and folder, and you tick what you want. Your picks are remembered: an unticked folder stays
+  skipped on every later sync (new files in it too) until you tick it again. You can also tick a video or
+  big file to get it anyway. Turn the switch off to go back to "download everything new"; the things you
+  unticked stay skipped.
 
 ## Troubleshooting
 

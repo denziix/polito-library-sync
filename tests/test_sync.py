@@ -137,6 +137,67 @@ class SyncTests(unittest.TestCase):
             self.assertEqual(api.downloaded, [])
             self.assertEqual(sorted(p.name for p in cfg.download_dir.iterdir()), ["Chimica", "FISICA 1"])
 
+    def test_scan_lists_only_what_sync_could_download(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg, api = make_cfg(tmp), FakeApi(TREE)
+            mine = cfg.download_dir / "FISICA 1" / "bad_name_.txt"  # already have this one
+            mine.write_text("mine")
+            courses = ps.scan(api, cfg)
+            self.assertEqual(api.downloaded, [])
+            self.assertEqual([c["name"] for c in courses], ["Fisica 1"])  # Chimica has no folder
+            week = courses[0]["children"][0]
+            self.assertEqual((week["type"], week["name"]), ("directory", "Week 1"))
+            files = {f["name"]: f for f in ps.node_files(courses[0])}
+            self.assertEqual(sorted(files), ["Lecture1.pdf", "lesson.mp4"])
+            self.assertEqual(files["lesson.mp4"]["off"], "video")
+            self.assertFalse(files["lesson.mp4"]["default"])
+            self.assertTrue(files["Lecture1.pdf"]["default"])
+            ps.sync(api, cfg)
+            self.assertEqual(len(list(ps.node_files(ps.scan(api, cfg)[0]))), 1)  # only the video is left
+
+    def test_picks_decide_what_sync_downloads(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg, api = make_cfg(tmp), FakeApi(TREE)
+            course = ps.scan(api, cfg)[0]
+            week = course["children"][0]
+            files = {f["name"]: f for f in ps.node_files(course)}
+            picks: dict = {}
+            ps.set_pick(picks, week, False)                 # untick the folder...
+            ps.set_pick(picks, files["lesson.mp4"], True)   # ...but take the video in it
+            self.assertEqual(picks, {"7/d1": False, "7/f11": True})
+            ps.save_picks(cfg, picks)
+            self.assertEqual(ps.load_picks(cfg), picks)
+            ps.sync(api, cfg)
+            self.assertEqual(sorted(api.downloaded), [(7, "11"), (7, "12")])
+            # A file added to the unticked folder later is skipped too.
+            api.downloaded.clear()
+            api.tree = [{**TREE[0], "files": TREE[0]["files"] + [
+                {"type": "file", "id": "13", "name": "Lecture2.pdf", "mimeType": "application/pdf",
+                 "sizeInKiloBytes": 10, "checksum": "ddd"}]}, TREE[1]]
+            ps.sync(api, cfg)
+            self.assertEqual(api.downloaded, [])
+            # Ticking the folder again goes back to the default (no pick needed for two pdfs).
+            course = ps.scan(api, cfg)[0]
+            self.assertEqual(sorted(f["name"] for f in ps.node_files(course)), ["Lecture1.pdf", "Lecture2.pdf"])
+            ps.set_pick(picks, course["children"][0], True)
+            self.assertEqual(picks, {"7/f11": True})
+            ps.set_pick(picks, course, False)  # a course pick replaces everything inside it
+            self.assertEqual(picks, {"7": False})
+            ps.set_pick(picks, course, True)
+            self.assertEqual(picks, {})
+            ps.save_picks(cfg, picks)
+            ps.sync(api, cfg)
+            self.assertEqual(sorted(api.downloaded), [(7, "10"), (7, "13")])
+
+    def test_ticking_a_folder_includes_its_videos(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg, api = make_cfg(tmp), FakeApi(TREE)
+            week = ps.scan(api, cfg)[0]["children"][0]
+            picks: dict = {}
+            ps.set_pick(picks, week, True)
+            self.assertEqual(picks, {"7/d1": True})  # the video is off by default, so the tick is kept
+            self.assertTrue(all(ps.picked(picks, f["chain"], f["default"]) for f in ps.node_files(week)))
+
     def test_helpers(self):
         self.assertEqual(ps.safe_name('a:b/c?'), "a_b_c_")
         self.assertEqual(ps.safe_name("..."), "unnamed")
@@ -217,6 +278,36 @@ class NoticeTests(unittest.TestCase):
         self.assertEqual([(h["notice_id"], h["kind"]) for h in heads], [(4, "Deadline")])
         groups = ps.group_events(events, today)
         self.assertEqual([g[0] for g in groups], ["Next 7 days"])
+
+    def test_snippets_skip_greetings_and_add_context(self):
+        today = ps.date(2026, 11, 16)
+        notices = [
+            notice(1, "Goodmorning,\nthe lecture of 20/11 is moved to room 7T.\nBest regards\nProf. Rossi"),
+            notice(2, "Buongiorno a tutti,\nil seminario si terrà:\ngiovedì 20 novembre ore 15\nAula 1P\n"
+                      "Cordiali saluti", course="Chimica", cid=9),
+            notice(3, "SEMINAR ALERT\nDear all, on 25/11 a guest from ESA will talk about rockets."),
+            notice(4, "Good morning, the deadline for the lab report has been extended, see the portal. "
+                      "Kind regards", published="2026-11-14T09:00:00Z"),
+        ]
+        events, heads = ps.extract_events(notices, today)
+        by_id = {e["notice_id"]: e for e in events}
+        self.assertEqual(by_id[1]["snippet"], "The lecture of 20/11 is moved to room 7T.")
+        self.assertEqual(by_id[2]["snippet"], "Il seminario si terrà: giovedì 20 novembre ore 15 · Aula 1P")
+        self.assertEqual(by_id[2]["time"], "15:00")
+        self.assertEqual(by_id[3]["title"], "SEMINAR ALERT")
+        self.assertEqual(by_id[3]["snippet"], "On 25/11 a guest from ESA will talk about rockets.")
+        self.assertEqual([h["snippet"] for h in heads],
+                         ["The deadline for the lab report has been extended, see the portal."])
+        self.assertEqual(ps.notice_preview("Dear students,\nGoodmorning\nthe lab is full."), "The lab is full.")
+        self.assertEqual(ps.notice_preview("Hi-res slides are online."), "Hi-res slides are online.")
+        self.assertEqual(ps.notice_preview("Prof. Rossi will give the lecture."), "Prof. Rossi will give the lecture.")
+        self.assertEqual(ps.notice_preview("Good morning, the lab is full. Kind regards"), "The lab is full.")
+        self.assertEqual(ps.notice_preview("LAIB practice 2\nDear all,\nbring your laptop.\nBest"),
+                         "LAIB practice 2 · Bring your laptop.")
+        self.assertEqual(ps.notice_preview("Dear Students, the lab is as follows\n• room 4\nA. Tonoli"),
+                         "The lab is as follows · room 4")
+        self.assertEqual(ps.notice_preview("Course rules\nI hope you are well. The rules are online."),
+                         "Course rules · The rules are online.")
 
 
 if __name__ == "__main__":

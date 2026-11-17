@@ -13,7 +13,6 @@ import math
 import os
 import queue
 import random
-import re
 import subprocess
 import sys
 import threading
@@ -152,21 +151,7 @@ def local_date(value: str | None, long: bool = False, with_time: bool = False) -
     return dt.strftime(fmt)
 
 
-_GREETING = re.compile(r"^(dear|cari|care|carissim|gentil|hello|hi|hey|good (morning|afternoon|evening)|"
-                       r"buongiorno|buonasera|salve|ciao)\b", re.I)
-
-
-def notice_preview(text: str) -> str:
-    """First line worth reading: skips 'Dear students,'-style greetings."""
-    lines = [ln.strip(" •\t") for ln in text.splitlines() if ln.strip(" •\t")]
-    for ln in lines:
-        if _GREETING.match(ln):
-            # "Dear students," -> skip the line; "Dear students, the lab moves..." -> keep what follows.
-            ln = ln.split(",", 1)[1].strip() if "," in ln else ""
-            if not ln:
-                continue
-        return ln[:1].upper() + ln[1:]
-    return lines[0] if lines else "(empty)"
+notice_preview = ps.notice_preview  # first line worth reading (skips "Goodmorning,"-style greetings)
 
 
 def countdown(d: date, today: date) -> str:
@@ -604,6 +589,229 @@ class Meter(_Canvas):
                 self.create_rectangle(0, 0, fw, h, fill=p["accent"], outline="")
 
 
+class Toggle(_Canvas):
+    """An on/off switch with its label: gradient track when on, a white knob that slides across."""
+    W, H = 42, 24
+
+    def __init__(self, master: tk.Misc, app: "App", text: str, value: bool,
+                 command: Callable[[bool], None], bg: str | None = None) -> None:
+        super().__init__(master, bg or app.pal["bg"], height=self.H + 4, cursor="hand2")
+        self.app, self.text, self.value, self.command = app, text, value, command
+        self.pos, self._job, self._hover = (1.0 if value else 0.0), None, False
+        self.font = (FONT_SEMI, 10)
+        super().configure(width=self.W + 12 + tkfont.Font(root=self, font=self.font).measure(text) + 2)
+        self.bind("<Button-1>", lambda _e: self.toggle())
+        self.bind("<Enter>", lambda _e: self._set_hover(True))
+        self.bind("<Leave>", lambda _e: self._set_hover(False))
+        self._paint()
+
+    def _set_hover(self, hover: bool) -> None:
+        self._hover = hover
+        self._paint()
+
+    def toggle(self) -> None:
+        self.value = not self.value
+        if self._job:
+            self.after_cancel(self._job)
+        t0, start, end = time.perf_counter(), self.pos, (1.0 if self.value else 0.0)
+
+        def step() -> None:
+            t = min((time.perf_counter() - t0) / 0.16, 1.0)
+            self.pos = start + (end - start) * (1 - (1 - t) ** 3)
+            self._paint()
+            self._job = self.after(12, step) if t < 1 else None
+
+        step()
+        self.command(self.value)
+
+    def _paint(self) -> None:
+        p, W, H, y = self.app.pal, self.W, self.H, 2
+        self.delete("all")
+        self._imgs.clear()
+        if self.pos >= 0.5:
+            stops = tuple(mix(c, "#FFFFFF", 0.12) for c in p["grad"]) if self._hover else p["grad"]
+            track, flat, outline = gfx.rounded(W, H, H // 2, gradient=stops), p["accent2"], None
+        else:
+            fill = mix(p["bg"], p["muted"], 0.30)
+            outline = p["accent2"] if self._hover else None
+            track, flat = gfx.rounded(W, H, H // 2, fill=fill, outline=outline), fill
+        if track is not None:
+            self.image(0, y, track, anchor="nw")
+        else:
+            self.create_rectangle(0, y, W, y + H, fill=flat, outline=outline or flat)
+        k = H - 6
+        x = 3 + (W - 6 - k) * self.pos
+        knob = gfx.rounded(k, k, k // 2, fill="#FFFFFF")
+        if knob is not None:
+            self.image(x, y + 3, knob, anchor="nw")
+        else:
+            self.create_oval(x, y + 3, x + k, y + 3 + k, fill="#FFFFFF", outline="")
+        self.create_text(W + 12, y + H / 2, text=self.text, fill=p["text"], font=self.font, anchor="w")
+
+
+def human_size(kb: float) -> str:
+    if kb < 1024:
+        return f"{max(kb, 1):.0f} KB"
+    mb = kb / 1024
+    return f"{mb:.1f} MB" if mb < 100 else f"{mb:.0f} MB" if mb < 1024 else f"{mb / 1024:.1f} GB"
+
+
+class PickerDialog(tk.Toplevel):
+    """Detailed download mode: tick the courses, folders and files to download (from ps.scan()).
+    Your picks are saved to data/choices.json and every later sync follows them."""
+
+    def __init__(self, app: "App", courses: list[dict], on_download: Callable[[], None]) -> None:
+        super().__init__(app)
+        self.app, self.courses, self.on_download = app, courses, on_download
+        p = self.pal = app.pal
+        self.picks = ps.load_picks(app.cfg)
+        self.before = dict(self.picks)
+        self.title("PoliTO Sync - pick files")
+        self.configure(bg=p["bg"])
+        self.transient(app)
+        self.minsize(640, 460)
+        w, h = 860, min(720, max(app.winfo_height() - 40, 520))
+        x = app.winfo_rootx() + (app.winfo_width() - w) // 2
+        y = app.winfo_rooty() + max((app.winfo_height() - h) // 3, 0)
+        self.geometry(f"{w}x{h}+{max(x, 0)}+{max(y, 0)}")
+
+        frm = tk.Frame(self, bg=p["bg"])
+        frm.pack(fill="both", expand=True, padx=28, pady=(22, 20))
+        tk.Label(frm, text="pick what to download", bg=p["bg"], fg=p["text"], font=(FONT_HEAD, 20)).pack(anchor="w")
+        tk.Label(frm, text="untick anything you don't need. picks are remembered: an unticked folder stays "
+                           "skipped on every sync (new files in it too) until you tick it again.",
+                 bg=p["bg"], fg=p["muted"], font=(FONT, 9), justify="left", wraplength=780).pack(anchor="w",
+                                                                                                pady=(2, 14))
+        bar = tk.Frame(frm, bg=p["bg"])
+        bar.pack(fill="x", pady=(0, 10))
+        PillButton(bar, app, "tick all", lambda: self._all(True), height=32, padx=14).pack(side="left")
+        PillButton(bar, app, "untick all", lambda: self._all(False), height=32, padx=14).pack(side="left", padx=8)
+        PillButton(bar, app, "open folders", lambda: self._expand(True), height=32, padx=14).pack(side="left")
+        PillButton(bar, app, "close folders", lambda: self._expand(False), height=32, padx=14).pack(side="left",
+                                                                                                     padx=8)
+        self.summary = tk.Label(bar, text="", bg=p["bg"], fg=p["muted"], font=(FONT_SEMI, 10))
+        self.summary.pack(side="right")
+
+        btns = tk.Frame(frm, bg=p["bg"])
+        btns.pack(side="bottom", fill="x", pady=(16, 0))
+        self.btn_go = PillButton(btns, app, "download", self._download, primary=True)
+        self.btn_go.pack(side="right")
+        PillButton(btns, app, "cancel", self.destroy).pack(side="right", padx=(0, 8))
+        tk.Label(btns, text="click a box to tick / untick  ·  ticking a folder takes everything in it",
+                 bg=p["bg"], fg=p["muted"], font=(FONT, 8)).pack(side="left")
+
+        card = RoundCard(frm, app, expand=True, pad=(10, 10))
+        card.pack(fill="both", expand=True)
+        tree = self.tree = ttk.Treeview(card.inner, columns=("size", "note"), show="tree headings",
+                                        selectmode="none", style="Picker.Treeview")
+        tree.heading("#0", text="  name", anchor="w")
+        tree.heading("size", text="size", anchor="e")
+        tree.heading("note", text="", anchor="w")
+        tree.column("#0", width=420, stretch=True)
+        tree.column("size", width=150, anchor="e", stretch=False)
+        tree.column("note", width=190, anchor="w", stretch=False)
+        tree.tag_configure("course", font=(FONT_HEAD, 11))
+        tree.tag_configure("dir", font=(FONT_SEMI, 10))
+        tree.tag_configure("off", foreground=p["muted"])
+        tree.pack(side="left", fill="both", expand=True)
+        sb = ttk.Scrollbar(card.inner, orient="vertical", command=tree.yview)
+        sb.pack(side="right", fill="y")
+        tree.configure(yscrollcommand=sb.set)
+        SmoothScroll(tree, "rows")
+        tree.bind("<Button-1>", self._click)
+        tree.bind("<Double-1>", lambda e: (self._click(e), "break")[1])
+        tree.bind("<space>", lambda _e: "break")
+
+        self.nodes: dict[str, dict] = {}
+        for i, course in enumerate(courses):
+            tag = f"c{i}"
+            tree.tag_configure(tag, foreground=app.course_color(course["name"]))
+            self._insert("", course, ("course", tag))
+        self._refresh()
+        self.bind("<Escape>", lambda _e: self.destroy())
+        dark_titlebar(self, app.mode == "dark")
+        self.grab_set()
+        self.focus_force()
+
+    def _insert(self, parent: str, node: dict, tags: tuple[str, ...] = ()) -> None:
+        kind = node["type"]
+        iid = self.tree.insert(parent, "end", text="  " + node["name"],
+                               open=kind == "course", tags=tags or (("dir",) if kind == "directory" else ()))
+        self.nodes[iid] = node
+        for child in node.get("children", []):
+            self._insert(iid, child)
+
+    def _state(self, node: dict) -> tuple[int, int, float]:
+        """(ticked files, all files, ticked size in KB) inside a node."""
+        on = total = 0
+        size = 0.0
+        for f in ps.node_files(node):
+            total += 1
+            if ps.picked(self.picks, f["chain"], f["default"]):
+                on += 1
+                size += f["size_kb"]
+        return on, total, size
+
+    def _box(self, state: str) -> Any:
+        p = self.pal
+        return gfx.checkbox(18, state, p["card"], mix(p["card"], p["muted"], 0.6), p["hot"])
+
+    def _refresh(self) -> None:
+        tree = self.tree
+        all_on = all_total = 0
+        all_size = 0.0
+        for iid, node in self.nodes.items():
+            on, total, size = self._state(node)
+            state = "on" if on == total else "off" if on == 0 else "some"
+            img = self._box(state)
+            mark = "" if img is not None else {"on": "☑ ", "off": "☐ ", "some": "◩ "}[state]
+            tags = [t for t in tree.item(iid, "tags") if t != "off"] + (["off"] if state == "off" else [])
+            if node["type"] == "file":
+                note = ""
+                if node["off"]:
+                    note = f"{node['off']} · off by default"
+                elif node["updated"]:
+                    note = "updated version"
+                elif ps.picked(self.before, node["chain"], node["default"]) is False:
+                    note = "skipped last time"
+                values = (human_size(node["size_kb"]), note)
+            else:
+                values = (human_size(size) if on else "–", f"{on} of {total} file{'s' if total != 1 else ''}")
+            if node["type"] == "course":
+                all_on, all_total, all_size = all_on + on, all_total + total, all_size + size
+            tree.item(iid, image=img if img is not None else "", text=f"  {mark}{node['name']}",
+                      values=values, tags=tags)
+        self.summary.configure(text=f"{all_on} of {all_total} files ticked" +
+                               (f"  ·  {human_size(all_size)}" if all_on else ""))
+        self.btn_go.configure(text=f"download {all_on} file{'s' if all_on != 1 else ''}" if all_on
+                              else "save picks")
+
+    def _click(self, e: tk.Event) -> None:
+        tree = self.tree
+        iid = tree.identify_row(e.y)
+        if not iid or "indicator" in tree.identify_element(e.x, e.y):
+            return  # the little arrow opens / closes a folder as usual
+        node = self.nodes[iid]
+        on, total, _ = self._state(node)
+        ps.set_pick(self.picks, node, on != total)  # all ticked -> untick; otherwise tick everything
+        self._refresh()
+
+    def _all(self, value: bool) -> None:
+        for course in self.courses:
+            ps.set_pick(self.picks, course, value)
+        self._refresh()
+
+    def _expand(self, open_: bool) -> None:
+        for iid, node in self.nodes.items():
+            if node["type"] == "directory":
+                self.tree.item(iid, open=open_)
+
+    def _download(self) -> None:
+        ps.save_picks(self.app.cfg, self.picks)
+        self.destroy()
+        self.on_download()
+
+
 class Ripple:
     """A pixelated colour ripple that washes over the whole window, starting from a button.
 
@@ -790,12 +998,74 @@ class Ripple:
             self.top = None
 
 
+class SmoothScroll:
+    """Smooth scrolling for one widget, with a mouse wheel or a trackpad. App._on_wheel feeds it.
+
+    A wheel notch (delta 120) glides over ~0.1s instead of jumping. Trackpad moves (Tk 9 sends them as
+    <TouchpadScroll>; older Tk as wheel deltas that aren't multiples of 120) follow the fingers directly,
+    with fractions carried over so slow swipes move too. mode "pixels": a Canvas with yscrollincrement=1,
+    or a Text. mode "rows": a Treeview (whole rows are the smallest step it can scroll).
+    """
+    PX_PER_NOTCH, ROWS_PER_NOTCH = 100, 3
+
+    def __init__(self, widget: tk.Misc, mode: str = "pixels") -> None:
+        self.w, self.rows = widget, mode == "rows"
+        self.per_notch = self.ROWS_PER_NOTCH if self.rows else self.PX_PER_NOTCH
+        self.unit = "pixels" if isinstance(widget, tk.Text) else "units"
+        self.pending = self.carry = 0.0
+        self.job: str | None = None
+        widget._smooth = self  # type: ignore[attr-defined] - found by App._on_wheel
+
+    def feed(self, delta: float, precise: bool) -> None:
+        amount = -delta / 120 * self.per_notch
+        if precise:  # trackpad: already a smooth stream of small moves
+            self._move(amount)
+            return
+        if self.pending * amount < 0:
+            self.pending = 0.0  # changed direction: drop the rest of the old glide
+        self.pending += amount
+        if self.job is None:
+            self._glide()
+
+    def _glide(self) -> None:
+        self.job = None
+        try:
+            if self.rows:  # a row per frame (more when far behind, e.g. a fast spin of the wheel)
+                step = math.copysign(min(max(1.0, abs(self.pending) * 0.25), abs(self.pending)), self.pending)
+            else:  # ease out: each frame covers 30% of what's left
+                step = self.pending * 0.3
+                if abs(step) < 1.5:
+                    step = self.pending
+            self.pending -= step
+            if not self._move(step):
+                self.pending = 0.0  # reached the top / bottom
+            if abs(self.pending) > 1e-6:
+                self.job = self.w.after(12, self._glide)
+        except tk.TclError:  # the widget is gone (theme change, dialog closed)
+            self.pending = 0.0
+
+    def _move(self, amount: float) -> bool:
+        """Scroll by amount (pixels or rows); keeps the fraction for next time. False at the end."""
+        total = self.carry + amount
+        n = int(total + (1e-6 if total > 0 else -1e-6))
+        self.carry = total - n
+        if not n:
+            return True
+        first, last = self.w.yview()
+        if (n < 0 and first <= 0) or (n > 0 and last >= 1):
+            self.carry = 0.0
+            return False
+        self.w.yview_scroll(n, self.unit)
+        return True
+
+
 class ScrollFrame(ttk.Frame):
     """A vertically scrolling area; .inner holds the content, on_width(width) fires on resize."""
 
     def __init__(self, master: tk.Misc, bg: str, on_width: Callable[[int], None]) -> None:
         super().__init__(master)
-        self.canvas = tk.Canvas(self, bg=bg, highlightthickness=0, bd=0, yscrollincrement=24)
+        self.canvas = tk.Canvas(self, bg=bg, highlightthickness=0, bd=0, yscrollincrement=1)
+        SmoothScroll(self.canvas)  # 1px units, so it can glide pixel by pixel
         vsb = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
         self.inner = tk.Frame(self.canvas, bg=bg)
         win = self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
@@ -809,12 +1079,6 @@ class ScrollFrame(ttk.Frame):
         self.canvas.configure(yscrollcommand=vsb.set)
         vsb.pack(side="right", fill="y")
         self.canvas.pack(side="left", fill="both", expand=True)
-        self.bind("<Enter>", lambda _e: self.canvas.bind_all("<MouseWheel>", self._wheel))
-        self.bind("<Leave>", lambda _e: self.canvas.unbind_all("<MouseWheel>"))
-
-    def _wheel(self, e: tk.Event) -> None:
-        if self.inner.winfo_height() > self.canvas.winfo_height():
-            self.canvas.yview_scroll(int(-e.delta / 120) * 2, "units")
 
     def clear(self) -> None:
         for w in self.inner.winfo_children():
@@ -960,7 +1224,9 @@ class App(tk.Tk):
         self.last_file = self.cfg.state_dir / "last_run.json"
         self.q: queue.Queue = queue.Queue()
         self.busy = self.nbusy = self.aibusy = False
-        self.dry = False
+        self.dry = self.scanning = False
+        # Detailed download mode: "sync now" first shows what's new and lets you pick (PickerDialog).
+        self.detailed = os.environ.get("POLITO_DETAILED_DOWNLOAD", "0").strip() == "1"
         self.total_missing = 0
         self.new_files: list[str] = []
         self.course_rows: list[tuple[tuple, list[str], str | None]] = []  # kept across theme rebuilds
@@ -982,6 +1248,18 @@ class App(tk.Tk):
         self.side_collapsed = os.environ.get("POLITO_SIDEBAR", "open").strip().lower() == "collapsed"
         self._side_job: str | None = None
         self.bind("<Control-b>", lambda _e: self.toggle_sidebar())
+        # One smooth wheel / trackpad handler for every scrolling area (see SmoothScroll). Tk's own
+        # list and text bindings are removed so they don't scroll as well (with a trackpad on Tk 9 they
+        # jump many rows at a time).
+        self.bind_all("<MouseWheel>", self._on_wheel)
+        for seq in ("<MouseWheel>", "<TouchpadScroll>"):
+            try:
+                if seq == "<TouchpadScroll>":
+                    self.bind_all(seq, lambda e: self._on_wheel(e, touchpad=True))
+                for cls in ("Treeview", "Text"):
+                    self.bind_class(cls, seq, "")
+            except tk.TclError:  # Tk 8.6 has no <TouchpadScroll>: trackpads send small wheel deltas there
+                pass
         self._setup_logging()
         self._apply_theme()
         self._build()
@@ -1017,6 +1295,20 @@ class App(tk.Tk):
         st.map("Treeview", background=[("selected", mix(p["card"], p["accent"], 0.28))],
                foreground=[("selected", p["text"])])
         st.configure("Treeview.Heading", font=(FONT_HEAD, 10))
+        # The file picker's tree (styles are set up here, before any widget exists: changing a style later
+        # makes sv-ttk repaint plain Tk widgets in its own colours).
+        st.configure("Picker.Treeview", background=p["card"], fieldbackground=p["card"], foreground=p["text"],
+                     rowheight=30, font=(FONT, 10), borderwidth=0, indicatorsize=9, indicatormargins=(4, 2, 6, 2))
+        st.map("Picker.Treeview", background=[("selected", p["card"])], foreground=[("selected", p["text"])])
+        st.configure("Picker.Treeview.Heading", font=(FONT_HEAD, 10))
+        try:  # Tk's own open/close arrow: with Tk 9 the Sun Valley one shows an arrow on files too
+            st.element_create("Picker.Treeitem.indicator", "from", "default")
+        except tk.TclError:
+            pass  # already made for this theme
+        st.layout("Picker.Treeview.Item", [("Treeitem.padding", {"sticky": "nswe", "children": [
+            ("Picker.Treeitem.indicator", {"side": "left", "sticky": ""}),
+            ("Treeitem.image", {"side": "left", "sticky": ""}),
+            ("Treeitem.text", {"sticky": "nswe"})]})])
         st.configure("Muted.TLabel", foreground=p["muted"], background=p["bg"])
         st.configure("Section.TLabel", foreground=p["muted"], background=p["bg"], font=(FONT_HEAD, 10))
         self.configure(bg=p["bg"])
@@ -1109,6 +1401,27 @@ class App(tk.Tk):
                 # RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW
                 user32.RedrawWindow(hwnd, None, None, 0x0001 | 0x0004 | 0x0080 | 0x0100)
         self.update()  # finish that repaint now, not during the first frames of the slide
+
+    def _on_wheel(self, e: tk.Event, touchpad: bool = False) -> None:
+        """Send a wheel / trackpad scroll to the scrolling area under the pointer."""
+        if e.state & 0x0001:  # shift + wheel = sideways; nothing here scrolls sideways
+            return
+        if touchpad:  # <TouchpadScroll> packs both directions in one number; same units as the wheel
+            low = int(e.delta) & 0xFFFF
+            delta, precise = (low - 0x10000 if low >= 0x8000 else low), True
+        else:
+            delta = int(e.delta)
+            precise = delta % 120 != 0  # older Tk: a trackpad sends small wheel steps
+        if not delta:
+            return
+        try:
+            w = self.winfo_containing(e.x_root, e.y_root) or e.widget
+        except (KeyError, tk.TclError):  # e.g. a combobox's drop-down list, which Tk made itself
+            return
+        while isinstance(w, tk.Misc) and not hasattr(w, "_smooth"):
+            w = w.master
+        if isinstance(w, tk.Misc):
+            w._smooth.feed(delta, precise)  # type: ignore[attr-defined]
 
     def course_color(self, name: str) -> str:
         colors = COURSE_COLORS[self.mode]
@@ -1289,7 +1602,7 @@ class App(tk.Tk):
         bar = tk.Frame(tab, bg=p["bg"])
         bar.pack(fill="x", pady=(0, 16))
         self.btn_sync = PillButton(bar, self, "sync now", lambda: self._rippled(
-            self.btn_sync, lambda: self.run(dry=False), "busy"), primary=True)
+            self.btn_sync, self.sync_now, "busy"), primary=True)
         self.btn_check = PillButton(bar, self, "check first", lambda: self.run(dry=True))
         self.btn_open = PillButton(bar, self, "open folder", lambda: open_path(self.cfg.download_dir))
         self.btn_sync.pack(side="left")
@@ -1298,7 +1611,14 @@ class App(tk.Tk):
         self.progress = Meter(bar, self, width=240)
         self.progress.pack(side="right", pady=15)
 
-        ttk.Label(tab, text="courses", style="Section.TLabel").pack(anchor="w", pady=(0, 8))
+        head = tk.Frame(tab, bg=p["bg"])
+        head.pack(fill="x", pady=(0, 8))
+        ttk.Label(head, text="courses", style="Section.TLabel").pack(side="left", anchor="s")
+        self.detail_toggle = Toggle(head, self, "detailed download mode", self.detailed, self.set_detailed)
+        self.detail_toggle.pack(side="right")
+        self.detail_hint = tk.Label(head, text="", bg=p["bg"], fg=p["muted"], font=(FONT, 9))
+        self.detail_hint.pack(side="right", padx=(0, 12))
+        self._detail_hint()
         card = RoundCard(tab, self, expand=True, pad=(10, 10))
         card.pack(fill="both", expand=True)
         cols = ("course", "have", "new", "skipped", "status")
@@ -1318,6 +1638,7 @@ class App(tk.Tk):
         sb = ttk.Scrollbar(card.inner, orient="vertical", command=self.tree.yview)
         sb.pack(side="right", fill="y")
         self.tree.configure(yscrollcommand=sb.set)
+        SmoothScroll(self.tree, "rows")
         self.tree.bind("<Double-1>", self._open_course)
 
         ttk.Label(tab, text="activity  ·  double-click a course to open its folder",
@@ -1328,6 +1649,7 @@ class App(tk.Tk):
                             font=(FONT_MONO, 9), padx=4, pady=2, borderwidth=0, highlightthickness=0,
                             insertbackground=p["text"])
         self.text.pack(fill="x")
+        SmoothScroll(self.text)
         for tag, color in (("ok", p["green"]), ("warn", p["orange"]), ("err", p["red"]), ("muted", p["muted"])):
             self.text.tag_configure(tag, foreground=color)
         self.text.configure(state="disabled")
@@ -1376,6 +1698,7 @@ class App(tk.Tk):
         nsb = ttk.Scrollbar(body, orient="vertical", command=self.ntree.yview)
         nsb.pack(side="right", fill="y")
         self.ntree.configure(yscrollcommand=nsb.set)
+        SmoothScroll(self.ntree, "rows")
         self.ntree.bind("<<TreeviewSelect>>", lambda _e: self._show_selected_notice())
         pane.add(left, weight=1)
 
@@ -1388,6 +1711,7 @@ class App(tk.Tk):
         tsb = ttk.Scrollbar(right.inner, orient="vertical", command=self.ntext.yview)
         tsb.pack(side="right", fill="y")
         self.ntext.configure(yscrollcommand=tsb.set)
+        SmoothScroll(self.ntext)
         t = self.ntext
         t.tag_configure("h2", font=(FONT_HEAD, 10), foreground=p["muted"], spacing1=16, spacing3=4)
         t.tag_configure("muted", foreground=p["muted"], font=(FONT, 9))
@@ -1787,9 +2111,15 @@ class App(tk.Tk):
             tk.Label(top, text=ev["time"], bg=p["card"], fg=p["text"], font=(FONT_HEAD, 10)).pack(side="left")
         tk.Label(top, text=ev["course"], bg=p["card"], fg=ccolor, font=(FONT_HEAD, 10)).pack(side="left",
                                                                                             padx=(14, 0))
+        title = ev.get("title")
+        if title and title.lower() not in ev["snippet"].lower():  # e.g. "SEMINAR ALERT", "LAIB practice 2"
+            head = tk.Label(body, text=title, bg=p["card"], fg=p["text"], font=(FONT_HEAD, 11),
+                            justify="left", anchor="w")
+            head.pack(fill="x", pady=(8, 0))
+            self.wrap_labels.append((head, 150))
         snippet = tk.Label(body, text=ev["snippet"], bg=p["card"], fg=p["text"], font=(FONT, 10),
                            justify="left", anchor="w")
-        snippet.pack(fill="x", pady=(8, 0))
+        snippet.pack(fill="x", pady=(4 if title else 8, 0))
         self.wrap_labels.append((snippet, 150))
 
     # --------------------------------------------------------------- claude
@@ -1866,8 +2196,65 @@ class App(tk.Tk):
         self.busy = busy
         state = "disabled" if busy else "normal"
         self.btn_check.configure(state=state)
-        self.btn_sync.configure(state=state, text="syncing…" if busy and not self.dry else "sync now")
+        text = "looking…" if busy and self.scanning else "syncing…" if busy and not self.dry else "sync now"
+        self.btn_sync.configure(state=state, text=text)
         self.configure(cursor="watch" if busy else "")
+
+    # ------------------------------------------------------- detailed download mode
+    def set_detailed(self, on: bool) -> None:
+        self.detailed = on
+        write_env({"POLITO_DETAILED_DOWNLOAD": "1" if on else "0"})
+        self._detail_hint()
+        self.status_var.set("detailed mode on: sync now shows what's new and you pick what to grab."
+                            if on else "detailed mode off: sync now grabs everything new.")
+
+    def _detail_hint(self) -> None:
+        self.detail_hint.configure(text="you pick files & folders before each download" if self.detailed
+                                   else "")
+
+    def sync_now(self) -> None:
+        """The 'sync now' button: straight download, or in detailed mode: look first, then the picker."""
+        if not self.detailed:
+            self.run(dry=False)
+            return
+        if self.busy:
+            return
+        if needs_setup():
+            SettingsDialog(self, first_run=True)
+            return
+        self.scanning = True
+        self.progress.set_max(1)
+        self._set_busy(True)
+        self.status_var.set("looking for new files…")
+        self._log("looking for new files to pick from…", "muted")
+        threading.Thread(target=self._scan_work, daemon=True).start()
+
+    def _scan_work(self) -> None:
+        try:
+            api = ps.PolitoApi(self.cfg)
+            courses = ps.scan(api, self.cfg, progress=lambda ev, data: self.q.put((ev, data)))
+            self.q.put(("scanned", courses))
+        except ps.AuthError as exc:
+            self.q.put(("error", str(exc)))
+        except Exception as exc:  # noqa: BLE001 - show anything to the user
+            self.q.put(("error", f"{type(exc).__name__}: {exc}"))
+
+    def _on_scan(self, name: str) -> None:
+        self.status_var.set(f"looking…  {name}")
+        self.progress.step(1)
+
+    def _on_scanned(self, courses: list) -> None:
+        self.scanning = False
+        self._set_busy(False)
+        self.progress.fill()
+        if not courses:
+            msg = "all caught up ✓  nothing new to pick from"
+            self.status_var.set(msg)
+            self._log(msg, "muted")
+            return
+        n = sum(len(list(ps.node_files(c))) for c in courses)
+        self.status_var.set(f"{n} file{'s' if n != 1 else ''} to pick from. tick what you want.")
+        PickerDialog(self, courses, on_download=lambda: self.run(dry=False))
 
     # ------------------------------------------------------------------- work
     def run(self, dry: bool) -> None:
@@ -1963,6 +2350,7 @@ class App(tk.Tk):
         self._log(msg, "ok" if new else "muted")
 
     def _on_error(self, msg: str) -> None:
+        self.scanning = False
         self._set_busy(False)
         self.status_var.set("something broke. details in the activity box.")
         self._log(msg, "err")

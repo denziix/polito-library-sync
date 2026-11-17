@@ -27,10 +27,23 @@ the user's own course folders. Shared with friends via GitHub (they use Download
   "all" first, then courses by latest notice, with "N new" chips) and "list" = that subject's notices with a
   "‹ subjects" back button (course column hidden for a single course). Typing in search from the boxes
   switches to "all"; `open_notice()` (from Upcoming) opens the notice inside its course's list.
-  List previews skip "Dear students,"-style greetings (`notice_preview()`).
+  List previews use `ps.notice_preview()` (title + gist, no greetings).
+  Files page: "detailed download mode" `Toggle` switch (`POLITO_DETAILED_DOWNLOAD=1` in `.env`). When on,
+  "sync now" runs `ps.scan()` in a thread (events "courses", "scan", then "scanned") and opens
+  `PickerDialog`: a Treeview of course > folders > files with tick boxes (`gfx.checkbox` images; tri-state
+  for folders), "N of M files" and sizes; "download N files" saves the picks and runs a normal sync.
   Sun Valley theme (`sv-ttk`) for stock ttk widgets. `PALETTES`/`KIND_COLORS`/`COURSE_COLORS` per mode,
   `POLITO_THEME=system|light|dark` in `.env`. Changing theme destroys and rebuilds the widgets
   (`set_theme`), so state that must survive lives on the App (`course_rows`, `log_lines`, notices, StringVars).
+  Scrolling: one `bind_all` handler (`App._on_wheel`) for `<MouseWheel>` and Tk 9's `<TouchpadScroll>`
+  (trackpads; same units as the wheel, 120 = a notch; on Tk 8.6 trackpads send wheel deltas that aren't
+  multiples of 120). It finds the widget under the pointer and walks up to one with a `SmoothScroll`
+  (`widget._smooth`): canvases (`ScrollFrame`, yscrollincrement=1) and Texts glide by pixels, Treeviews
+  by rows. Tk's own Treeview/Text wheel bindings are removed (`bind_class(..., "")`): on Tk 9 they jump
+  many rows per trackpad event. New scrolling areas need `SmoothScroll(widget[, "rows"])`.
+  All ttk style setup belongs in `_apply_theme()` (before widgets exist): any style change later fires
+  <<ThemeChanged>>, and sv-ttk then repaints plain Tk widgets in its own grey. The picker uses Tk's own
+  tree arrow (`Picker.Treeitem.indicator` from "default"): with Tk 9 the sv-ttk one shows arrows on files too.
 - `ui_gfx.py` - Pillow drawing (Tk can't anti-alias): rounded shapes, gradients, mesh-gradient hero
   (blobs placed in gradient order, so the last colour stays a splash on the right), colour emoji
   (Segoe UI Emoji). Cached with lru_cache; `clear_cache()` on theme change / new root.
@@ -56,8 +69,12 @@ the user's own course folders. Shared with friends via GitHub (they use Download
 - `fetch_notices()` reads all study-plan courses' notices, converts HTML to text, caches them in
   `data/notices.json` (with a `seen` list: notices not seen before get `new: True`; the first fetch is a baseline).
 - `extract_events()` is the offline "assistant": finds dates (EN/IT, numeric and month names, no-year
-  dates roll forward), times and a kind (Seminar / talk, Exam, Deadline, Class change, Lab) per sentence;
-  undated important notices from the last 14 days become "heads-up". Works with no API key.
+  dates roll forward), times (also "ore 15") and a kind (Seminar / talk, Exam, Deadline, Class change, Lab)
+  per sentence; undated important notices from the last 14 days become "heads-up". Works with no API key.
+  Card text: `_event_snippet()` = the date sentence + a lead-in line ending in ":" + the next sentence(s)
+  when short; `notice_title()` = a short first line ("SEMINAR ALERT"); `notice_gist()` for heads-up.
+  Greetings ("Goodmorning,", "Dear all,", "Cari studenti,"), pleasantries, sign-offs and signatures
+  ("A. Tonoli") are dropped (`strip_greeting()`, `_filler()`).
 - `ai_summary()` is optional: Claude (`claude-opus-5-5`) writes a digest if `anthropic` is installed and
   `ANTHROPIC_API_KEY` is in `.env` (Settings has the field). Not a required dependency.
 
@@ -75,6 +92,12 @@ the user's own course folders. Shared with friends via GitHub (they use Download
 - New files go to `<course>/New/<portal subfolders>/`. Never move, modify or delete the user's files.
 - `data/state.json` remembers each `courseId/fileId` + checksum; changed checksum -> re-download.
 - Videos/audio and files > 200 MB skipped by default.
+- Picks (detailed download mode): `data/choices.json` `{"picks": {key: true|false}}`, keys `"<courseId>"`,
+  `"<courseId>/d<folderId>"`, `"<courseId>/f<fileId>"`. A file follows its own pick, else its nearest
+  folder's, else its course's, else the default above (`picked()` over `pick_chain()`). Every sync (GUI,
+  CLI, run_sync.bat) respects them, so an unticked folder also skips files added to it later. Unticked
+  files are not recorded in state.json, so ticking them later downloads them. `set_pick()` (what a click
+  does) clears picks inside the node and drops picks that change nothing.
 
 ## Conventions
 - `.env`, `data/`, `.venv/` are git-ignored. Never commit credentials or personal paths
