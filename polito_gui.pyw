@@ -869,7 +869,8 @@ class SettingsDialog(tk.Toplevel):
         ttk.Checkbutton(frm, text="show", variable=self.show,
                         command=lambda: self.pw_entry.configure(show="" if self.show.get() else "•")
                         ).grid(row=4, column=2, padx=(8, 0), pady=(10, 0))
-        label(6, "download folder", "the folder that holds (or will hold) one subfolder per course.")
+        label(6, "download folder", "the one folder for all your subjects. with the box below ticked, the app "
+                                    "makes a folder for each subject in it right after you log in.")
         ttk.Entry(frm, textvariable=self.folder, width=36).grid(row=6, column=1, sticky="we", pady=(10, 0))
         ttk.Button(frm, text="browse…", command=self._browse).grid(row=6, column=2, padx=(8, 0), pady=(10, 0))
         ttk.Checkbutton(frm, text="create a folder for each course automatically\n"
@@ -931,6 +932,8 @@ class SettingsDialog(tk.Toplevel):
         self.app.reload_config()
         if theme != self.app.theme_mode:
             self.app.set_theme(theme)
+        if self.create.get():
+            self.app.prepare_course_folders()  # log in now and make a folder for every subject
 
 
 # --------------------------------------------------------------------------- app
@@ -1228,6 +1231,51 @@ class App(tk.Tk):
             return
         Ripple(self, button)
         action()
+
+    def prepare_course_folders(self) -> None:
+        """Right after you save your login: log in, read your study plan and make one folder per subject
+        in the download folder (folders you already have are reused, never touched)."""
+        if self.busy:
+            return
+        self._set_busy(True)
+        self.status_var.set("logging in and setting up your subject folders…")
+        threading.Thread(target=self._folders_work, daemon=True).start()
+
+    def _folders_work(self) -> None:
+        try:
+            api = ps.PolitoApi(self.cfg)
+            courses = ps.study_plan_courses(api, self.cfg)
+            created = ps.create_course_folders(self.cfg, courses)
+            self.q.put(("folders", ([p.name for p in created], len(courses))))
+        except ps.AuthError as exc:
+            self.q.put(("folders_error", str(exc)))
+        except Exception as exc:  # noqa: BLE001 - show anything to the user
+            self.q.put(("folders_error", f"{type(exc).__name__}: {exc}"))
+
+    def _on_folders(self, data: tuple[list[str], int]) -> None:
+        names, total = data
+        self._set_busy(False)
+        if not names:
+            msg = f"logged in ✓  all {total} subjects already have a folder"
+            self.status_var.set(msg)
+            self._log(msg, "ok")
+            return
+        msg = f"logged in ✓  made {len(names)} subject folder{'s' if len(names) != 1 else ''}"
+        self.status_var.set(msg + ". hit sync now to fill them.")
+        self._log(msg, "ok")
+        nl = "\n"
+        listing = nl.join(f"•  {n}" for n in names[:15])
+        if len(names) > 15:
+            listing += f"{nl}…and {len(names) - 15} more"
+        messagebox.showinfo("PoliTO Sync", f"Logged in! Found {total} subjects in your study plan and made a "
+                            f"folder for each new one in{nl}{self.cfg.download_dir}{nl}{nl}{listing}{nl}{nl}"
+                            "Click “sync now” to download the course files into them.")
+
+    def _on_folders_error(self, msg: str) -> None:
+        self._set_busy(False)
+        self.status_var.set("couldn't log in. check your student ID and password in settings.")
+        self._log(msg, "err")
+        messagebox.showerror("PoliTO Sync", "Could not log in or read your subjects:\n" + msg)
 
     def open_settings(self) -> None:
         if self.busy:
@@ -1887,6 +1935,8 @@ class App(tk.Tk):
         level, msg = data
         if msg.startswith("Downloaded "):
             self._log("⬇  " + Path(msg[len("Downloaded "):]).name, "ok")
+        elif msg.startswith("Created folder "):
+            self._log("+  new folder: " + Path(msg[len("Created folder "):]).name, "ok")
         elif level >= logging.ERROR:
             self._log(msg, "err")
         elif level >= logging.WARNING:

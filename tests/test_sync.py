@@ -108,11 +108,42 @@ class SyncTests(unittest.TestCase):
             self.assertEqual(api.downloaded, [])
             self.assertFalse((cfg.state_dir / "state.json").exists())
 
+    def test_create_course_folders(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg, api = make_cfg(tmp), FakeApi(TREE)
+            courses = ps.study_plan_courses(api, cfg)
+            self.assertEqual([c["name"] for c in courses], ["Fisica 1", "Chimica"])  # "Other" not in plan
+            created = ps.create_course_folders(cfg, courses)
+            self.assertEqual(created, [cfg.download_dir / "Chimica"])  # "FISICA 1" already matches Fisica 1
+            self.assertEqual(sorted(p.name for p in cfg.download_dir.iterdir()), ["Chimica", "FISICA 1"])
+            self.assertEqual(ps.create_course_folders(cfg, courses), [])  # nothing new the second time
+
+    def test_create_course_folders_uses_course_map_and_makes_download_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg, api = make_cfg(tmp), FakeApi(TREE)
+            cfg.download_dir = Path(tmp) / "fresh" / "All subjects"  # does not exist yet
+            cfg.course_map = {"Chimica": "Chemistry"}
+            ps.create_course_folders(cfg, ps.study_plan_courses(api, cfg))
+            self.assertEqual(sorted(p.name for p in cfg.download_dir.iterdir()), ["Chemistry", "Fisica 1"])
+
+    def test_sync_makes_folders_even_for_courses_without_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_cfg(tmp)
+            cfg.create_missing = True
+            api = FakeApi([TREE[0]["files"][1]])  # only a video, which is skipped
+            ps.sync(api, cfg, dry_run=True)
+            self.assertFalse((cfg.download_dir / "Chimica").exists())  # a preview changes nothing
+            ps.sync(api, cfg)
+            self.assertEqual(api.downloaded, [])
+            self.assertEqual(sorted(p.name for p in cfg.download_dir.iterdir()), ["Chimica", "FISICA 1"])
+
     def test_helpers(self):
         self.assertEqual(ps.safe_name('a:b/c?'), "a_b_c_")
         self.assertEqual(ps.safe_name("..."), "unnamed")
         self.assertEqual(ps.file_key("Slides[1].pdf"), ps.file_key("slides.pdf"))
         self.assertEqual(ps.file_key("Slides (2).pdf"), "slides.pdf")
+        self.assertEqual(ps.course_folder_name({"id": 1, "name": "Project management and cost/value analysis"}),
+                         "Project management and cost-value analysis")
         self.assertEqual(ps.norm("Propulsion Systems & their..."), "propulsionsystemstheir")
 
 

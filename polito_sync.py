@@ -242,6 +242,11 @@ def file_key(name: str) -> str:
     return _DUP.sub("", name).strip().lower()
 
 
+def course_folder_name(course: dict[str, Any]) -> str:
+    """Folder name for a new course folder: the course name, made safe for Windows ("a/b" -> "a-b")."""
+    return safe_name((course.get("name") or str(course["id"])).replace("/", "-"))
+
+
 def resolve_course_dir(course: dict[str, Any], folders: dict[str, Path], cfg: Config) -> Path | None:
     name = course.get("name", "")
     mapped = cfg.course_map.get(name) or cfg.course_map.get(str(course["id"]))
@@ -250,7 +255,7 @@ def resolve_course_dir(course: dict[str, Any], folders: dict[str, Path], cfg: Co
     if norm(name) in folders:
         return folders[norm(name)]
     if cfg.create_missing:
-        return cfg.download_dir / safe_name(name or str(course["id"]))
+        return cfg.download_dir / course_folder_name(course)
     return None
 
 
@@ -263,6 +268,38 @@ def local_index(folder: Path) -> set[str]:
 Progress = Callable[[str, Any], None]
 
 
+def study_plan_courses(api: PolitoApi, cfg: Config) -> list[dict[str, Any]]:
+    """Your courses (only the ones in your study plan unless POLITO_ONLY_STUDY_PLAN=0)."""
+    return [c for c in api.courses() if not cfg.only_study_plan or c.get("isInPersonalStudyPlan", True)]
+
+
+def local_folders(cfg: Config) -> dict[str, Path]:
+    """Folders in the download folder, keyed by their loose name (see norm())."""
+    if not cfg.download_dir.is_dir():
+        return {}
+    return {norm(p.name): p for p in cfg.download_dir.iterdir() if p.is_dir()}
+
+
+def create_course_folders(cfg: Config, courses: list[dict[str, Any]]) -> list[Path]:
+    """Make a folder in the download folder for every course that doesn't have one yet.
+
+    Uses the same matching as sync (course_map.json, then loose name match), so a folder you already
+    have - even named a little differently - is reused, never duplicated. Only creates folders; never
+    touches existing ones. Returns the folders it created.
+    """
+    cfg.download_dir.mkdir(parents=True, exist_ok=True)
+    folders = local_folders(cfg)
+    created: list[Path] = []
+    for course in courses:
+        path = resolve_course_dir(course, folders, cfg) or cfg.download_dir / course_folder_name(course)
+        if not path.exists():
+            path.mkdir(parents=True)
+            created.append(path)
+            log.info("Created folder %s", path)
+        folders[norm(path.name)] = path
+    return created
+
+
 def sync(api: PolitoApi, cfg: Config, init_only: bool = False, dry_run: bool = False,
          progress: Progress | None = None) -> list[Path]:
     """progress(event, data) is called with ("courses", n), ("course", stats) and ("file", path)."""
@@ -271,10 +308,6 @@ def sync(api: PolitoApi, cfg: Config, init_only: bool = False, dry_run: bool = F
     state = load_state(state_path)
     known: dict[str, Any] = state.setdefault("files", {})
     new_files: list[Path] = []
-    folders = (
-        {norm(p.name): p for p in cfg.download_dir.iterdir() if p.is_dir()}
-        if cfg.download_dir.is_dir() else {}
-    )
 
     def record(key: str, f: dict[str, Any], path: Path) -> None:
         if dry_run:
@@ -286,8 +319,10 @@ def sync(api: PolitoApi, cfg: Config, init_only: bool = False, dry_run: bool = F
         }
         save_state(state_path, state)  # persist progress after each file
 
-    courses = [c for c in api.courses()
-               if not cfg.only_study_plan or c.get("isInPersonalStudyPlan", True)]
+    courses = study_plan_courses(api, cfg)
+    if cfg.create_missing and not dry_run:
+        create_course_folders(cfg, courses)  # every course gets a folder, even one with no files yet
+    folders = local_folders(cfg)
     emit("courses", len(courses))
     for course in courses:
         cname = course.get("name", str(course["id"]))
@@ -403,8 +438,7 @@ def fetch_notices(api: PolitoApi, cfg: Config, progress: Progress | None = None)
     cache = load_state(cache_path)
     seen = set(cache.get("seen", []))
     first_time = "seen" not in cache  # first fetch: nothing is "new", just a baseline
-    courses = [c for c in api.courses()
-               if not cfg.only_study_plan or c.get("isInPersonalStudyPlan", True)]
+    courses = study_plan_courses(api, cfg)
     emit("courses", len(courses))
     out: list[dict[str, Any]] = []
     for course in courses:

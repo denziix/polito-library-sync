@@ -65,6 +65,11 @@ the user's own course folders. Shared with friends via GitHub (they use Download
 - Course -> local folder: `course_map.json` override, else loose name match (`norm()`: lowercase,
   alphanumerics only) against folders in `POLITO_DOWNLOAD_DIR`; unmatched -> skipped with a warning,
   unless `POLITO_CREATE_MISSING_COURSE_FOLDERS=1`.
+- With that option on (default for new installs via `.env.example` and the first-run Settings box),
+  `create_course_folders()` makes one folder per study-plan course (`course_folder_name()`: "a/b" -> "a-b"),
+  reusing matched folders: right after Settings is saved (GUI logs in, then shows what it made) and at
+  the start of every real sync (not `--dry-run`), so courses without files still get a folder.
+  The owner's own install has it off (own folder layout) - don't turn it on for them.
 - Files already anywhere in the course folder (name match via `file_key()`, ignores `[1]`/`(2)`) are
   recorded as present, not downloaded.
 - New files go to `<course>/New/<portal subfolders>/`. Never move, modify or delete the user's files.
